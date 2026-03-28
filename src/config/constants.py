@@ -199,6 +199,13 @@ FIRST_NAMES = [
     "Grace", "Lily", "Chloe", "Zoey", "Nora", "Aria", "Hazel", "Aurora", "Stella", "Ivy"
 ]
 
+LAST_NAMES = [
+    "Smith", "Johnson", "Williams", "Brown", "Jones", "Garcia", "Miller", "Davis", "Rodriguez", "Martinez",
+    "Hernandez", "Lopez", "Gonzalez", "Wilson", "Anderson", "Thomas", "Taylor", "Moore", "Jackson", "Martin",
+    "Lee", "Perez", "Thompson", "White", "Harris", "Sanchez", "Clark", "Ramirez", "Lewis", "Robinson",
+    "Walker", "Young", "Allen", "King", "Wright", "Scott", "Torres", "Nguyen", "Hill", "Flores",
+]
+
 def generate_random_user_info() -> dict:
     """
     生成随机用户信息
@@ -206,8 +213,8 @@ def generate_random_user_info() -> dict:
     Returns:
         包含 name 和 birthdate 的字典
     """
-    # 随机选择名字
-    name = random.choice(FIRST_NAMES)
+    # 注册阶段使用更像真人资料的姓名格式，降低单名触发风控的概率。
+    name = f"{random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}"
 
     # 生成随机生日（18-45岁）
     current_year = datetime.now().year

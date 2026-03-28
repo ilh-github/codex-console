@@ -206,8 +206,20 @@ class TempMailService(BaseEmailService):
         if semantic_match:
             return semantic_match.group(1), True
 
-        simple_match = re.search(pattern, text)
-        if simple_match:
+        def _embedded_in_email(start: int, end: int) -> bool:
+            token_start = start
+            token_end = end
+            while token_start > 0 and (not text[token_start - 1].isspace()) and text[token_start - 1] not in "<>\"'(),;[]{}":
+                token_start -= 1
+            while token_end < len(text) and (not text[token_end].isspace()) and text[token_end] not in "<>\"'(),;[]{}":
+                token_end += 1
+            token = text[token_start:token_end]
+            return "@" in token and bool(re.search(r"@[A-Za-z0-9.-]+\.[A-Za-z]{2,}", token))
+
+        for simple_match in re.finditer(pattern, text):
+            start, end = simple_match.span(1)
+            if _embedded_in_email(start, end):
+                continue
             return simple_match.group(1), False
 
         return None, False
