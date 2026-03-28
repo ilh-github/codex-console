@@ -1,7 +1,7 @@
 import base64
 import json
 
-from src.config.constants import EmailServiceType, OPENAI_API_ENDPOINTS, OPENAI_PAGE_TYPES
+from src.config.constants import EmailServiceType, OPENAI_API_ENDPOINTS, OPENAI_PAGE_TYPES, generate_random_user_info
 from src.core.http_client import OpenAIHTTPClient
 from src.core.openai.oauth import OAuthStart
 from src.core.register import RegistrationEngine
@@ -132,10 +132,20 @@ class FakeOpenAIClient:
     def check_ip_location(self):
         return True, "US"
 
-    def check_sentinel(self, did):
+    def check_sentinel(self, did, proxies=None, *, flow="authorize_continue", include_pow=True, return_payload=False):
         if not self._sentinel_tokens:
             raise AssertionError("no sentinel token queued")
-        return self._sentinel_tokens.pop(0)
+        token = self._sentinel_tokens.pop(0)
+        if isinstance(token, dict):
+            payload = {
+                "token": str(token.get("token") or "").strip(),
+                "so_token": str(token.get("so_token") or "").strip(),
+                "flow": flow,
+            }
+            return payload if return_payload else payload["token"]
+        if return_payload:
+            return {"token": str(token or "").strip(), "so_token": "", "flow": flow}
+        return token
 
     def close(self):
         if self._session_index + 1 < len(self._sessions):
@@ -187,6 +197,108 @@ def test_check_sentinel_sends_non_empty_pow(monkeypatch):
     assert body["p"] == "gAAAAACpow-token"
 
 
+def test_check_sentinel_supports_custom_flow_without_pow():
+    session = QueueSession([
+        ("POST", OPENAI_API_ENDPOINTS["sentinel"], DummyResponse(payload={"token": "sentinel-token", "so_token": "so-token"})),
+    ])
+    client = OpenAIHTTPClient()
+    client._session = session
+
+    payload = client.check_sentinel(
+        "device-2",
+        flow="oauth_create_account",
+        include_pow=False,
+        return_payload=True,
+    )
+
+    assert payload == {
+        "token": "sentinel-token",
+        "so_token": "so-token",
+        "flow": "oauth_create_account",
+    }
+    body = json.loads(session.calls[0]["kwargs"]["data"])
+    assert body["id"] == "device-2"
+    assert body["flow"] == "oauth_create_account"
+    assert body["p"] == ""
+
+
+def test_generate_random_user_info_returns_full_name():
+    info = generate_random_user_info()
+    first, last = info["name"].split(" ", 1)
+    assert first
+    assert last
+
+
+def test_get_workspace_id_falls_back_to_auth_session_payload():
+    session = QueueSession([
+        (
+            "GET",
+            "https://chatgpt.com/api/auth/session",
+            DummyResponse(payload={"account": {"workspace_id": "org-auth-session"}}),
+        ),
+    ])
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.session = session
+
+    workspace_id = engine._get_workspace_id()
+
+    assert workspace_id == "org-auth-session"
+
+
+def test_select_workspace_uses_last_continue_url_as_referer():
+    session = QueueSession([
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["select_workspace"],
+            DummyResponse(payload={"continue_url": "https://auth.example.test/continue"}),
+        ),
+    ])
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.session = session
+    engine._last_validate_otp_continue_url = "https://auth.openai.com/add-phone"
+
+    continue_url = engine._select_workspace("org-123")
+
+    assert continue_url == "https://auth.example.test/continue"
+    assert session.calls[0]["kwargs"]["headers"]["referer"] == "https://auth.openai.com/add-phone"
+
+
+def test_extract_session_token_from_cookie_text_supports_authjs_name():
+    token = RegistrationEngine._extract_session_token_from_cookie_text(
+        "foo=bar; __Secure-authjs.session-token=authjs-token-value; path=/"
+    )
+
+    assert token == "authjs-token-value"
+
+
+def test_extract_session_token_from_cookie_jar_supports_authjs_chunks():
+    token = RegistrationEngine._extract_session_token_from_cookie_jar(
+        {
+            "__Secure-authjs.session-token.0": "chunk-a",
+            "__Secure-authjs.session-token.1": "chunk-b",
+        }
+    )
+
+    assert token == "chunk-achunk-b"
+
+
+def test_visit_continue_url_for_session_keeps_chatgpt_callback():
+    callback_url = "https://chatgpt.com/api/auth/callback/openai?code=abc&state=xyz"
+    session = QueueSession([
+        ("GET", callback_url, DummyResponse(status_code=200)),
+    ])
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.session = session
+
+    final_url = engine._visit_continue_url_for_session(callback_url)
+
+    assert final_url == callback_url
+    assert session.calls[0]["url"] == callback_url
+
+
 def test_run_registers_then_relogs_to_fetch_token():
     session_one = QueueSession([
         ("GET", "https://auth.example.test/flow/1", _response_with_did("did-1")),
@@ -231,7 +343,10 @@ def test_run_registers_then_relogs_to_fetch_token():
     email_service = FakeEmailService(["123456", "654321"])
     engine = RegistrationEngine(email_service)
     fake_oauth = FakeOAuthManager()
-    engine.http_client = FakeOpenAIClient([session_one, session_two], ["sentinel-1", "sentinel-2"])
+    engine.http_client = FakeOpenAIClient(
+        [session_one, session_two],
+        ["sentinel-1", {"token": "sentinel-create", "so_token": "so-create"}, "sentinel-2"],
+    )
     engine.oauth_manager = fake_oauth
 
     result = engine.run()
@@ -247,6 +362,22 @@ def test_run_registers_then_relogs_to_fetch_token():
     assert sum(1 for call in session_two.calls if call["url"] == OPENAI_API_ENDPOINTS["send_otp"]) == 0
     assert sum(1 for call in session_one.calls if call["url"] == OPENAI_API_ENDPOINTS["select_workspace"]) == 0
     assert sum(1 for call in session_two.calls if call["url"] == OPENAI_API_ENDPOINTS["select_workspace"]) == 1
+    create_account_call = next(call for call in session_one.calls if call["url"] == OPENAI_API_ENDPOINTS["create_account"])
+    create_account_headers = create_account_call["kwargs"]["headers"]
+    assert create_account_headers["referer"] == "https://auth.openai.com/about-you"
+    assert json.loads(create_account_headers["openai-sentinel-token"]) == {
+        "p": "",
+        "t": "",
+        "c": "sentinel-create",
+        "id": "did-1",
+        "flow": "oauth_create_account",
+    }
+    assert json.loads(create_account_headers["openai-sentinel-so-token"]) == {
+        "so": "so-create",
+        "c": "sentinel-create",
+        "id": "did-1",
+        "flow": "oauth_create_account",
+    }
     relogin_start_body = json.loads(session_two.calls[1]["kwargs"]["data"])
     assert relogin_start_body["screen_hint"] == "login"
     assert relogin_start_body["username"]["value"] == "tester@example.com"

@@ -350,25 +350,38 @@ class OpenAIHTTPClient(HTTPClient):
         except cffi_requests.RequestsError as e:
             raise HTTPClientError(f"OpenAI 请求失败: {endpoint} - {e}")
 
-    def check_sentinel(self, did: str, proxies: Optional[Dict] = None) -> Optional[str]:
+    def check_sentinel(
+        self,
+        did: str,
+        proxies: Optional[Dict] = None,
+        *,
+        flow: str = "authorize_continue",
+        include_pow: bool = True,
+        return_payload: bool = False,
+    ) -> Optional[Union[str, Dict[str, str]]]:
         """
         检查 Sentinel 拦截
 
         Args:
             did: Device ID
             proxies: 代理配置
+            flow: Sentinel flow 名称
+            include_pow: 是否在请求体里附带 POW 令牌
+            return_payload: 是否返回完整 payload
 
         Returns:
-            Sentinel token 或 None
+            Sentinel token、完整 payload 或 None
         """
         from ..config.constants import OPENAI_API_ENDPOINTS
 
         try:
-            pow_token = build_sentinel_pow_token(self.default_headers.get("User-Agent", ""))
+            pow_token = ""
+            if include_pow:
+                pow_token = build_sentinel_pow_token(self.default_headers.get("User-Agent", ""))
             sen_req_body = json.dumps({
                 "p": pow_token,
                 "id": did,
-                "flow": "authorize_continue",
+                "flow": flow,
             }, separators=(",", ":"))
 
             response = self.post(
@@ -382,7 +395,15 @@ class OpenAIHTTPClient(HTTPClient):
             )
 
             if response.status_code == 200:
-                return response.json().get("token")
+                payload = response.json() or {}
+                if return_payload:
+                    return {
+                        "token": str(payload.get("token") or "").strip(),
+                        "so_token": str(payload.get("so_token") or "").strip(),
+                        "flow": flow,
+                    }
+                token = str(payload.get("token") or "").strip()
+                return token or None
             else:
                 logger.warning(f"Sentinel 检查失败: {response.status_code}")
                 return None

@@ -17,7 +17,7 @@ from datetime import datetime
 from curl_cffi import requests as cffi_requests
 
 from .openai.oauth import OAuthManager, OAuthStart
-from .http_client import OpenAIHTTPClient, HTTPClientError
+from .http_client import OpenAIHTTPClient, HTTPClientError, RequestConfig
 from ..services import EmailServiceFactory, BaseEmailService, EmailServiceType
 from ..database import crud
 from ..database.session import get_db
@@ -113,7 +113,11 @@ class RegistrationEngine:
         self.task_uuid = task_uuid
 
         # 创建 HTTP 客户端
-        self.http_client = OpenAIHTTPClient(proxy_url=proxy_url)
+        # 注册阶段对齐已验证可用链路，使用更接近真实浏览器的新指纹。
+        self.http_client = OpenAIHTTPClient(
+            proxy_url=proxy_url,
+            config=RequestConfig(impersonate="chrome142"),
+        )
 
         # 创建 OAuth 管理器
         settings = get_settings()
@@ -225,6 +229,10 @@ class RegistrationEngine:
                 "oai-client-auth-session",
                 "__Secure-next-auth.session-token",
                 "_Secure-next-auth.session-token",
+                "next-auth.session-token",
+                "__Secure-authjs.session-token",
+                "_Secure-authjs.session-token",
+                "authjs.session-token",
             ):
                 try:
                     _push(key, self.session.cookies.get(key))
@@ -243,6 +251,23 @@ class RegistrationEngine:
         """
         if not cookie_jar:
             return ""
+
+        direct_names = {
+            "__Secure-next-auth.session-token",
+            "_Secure-next-auth.session-token",
+            "next-auth.session-token",
+            "__Secure-authjs.session-token",
+            "_Secure-authjs.session-token",
+            "authjs.session-token",
+        }
+        chunk_prefixes = (
+            "__Secure-next-auth.session-token.",
+            "_Secure-next-auth.session-token.",
+            "next-auth.session-token.",
+            "__Secure-authjs.session-token.",
+            "_Secure-authjs.session-token.",
+            "authjs.session-token.",
+        )
 
         entries: list[tuple[str, str]] = []
         try:
@@ -267,17 +292,14 @@ class RegistrationEngine:
         direct_candidates = [
             val
             for name, val in entries
-            if name in ("__Secure-next-auth.session-token", "_Secure-next-auth.session-token") and val
+            if name in direct_names and val
         ]
         if direct_candidates:
             return max(direct_candidates, key=len)
 
         chunk_map: dict[int, str] = {}
         for name, value in entries:
-            if not (
-                name.startswith("__Secure-next-auth.session-token.")
-                or name.startswith("_Secure-next-auth.session-token.")
-            ):
+            if not any(name.startswith(prefix) for prefix in chunk_prefixes):
                 continue
             if not value:
                 continue
@@ -770,13 +792,19 @@ class RegistrationEngine:
         if not text:
             return ""
 
-        direct = re.search(r"(?:^|[;,]\s*)(?:__|_)Secure-next-auth\.session-token=([^;,]*)", text)
+        direct = re.search(
+            r"(?:^|[;,]\s*)(?:__Secure-next-auth\.session-token|_Secure-next-auth\.session-token|next-auth\.session-token|__Secure-authjs\.session-token|_Secure-authjs\.session-token|authjs\.session-token)=([^;,]*)",
+            text,
+        )
         if direct:
             direct_val = str(direct.group(1) or "").strip().strip('"').strip("'")
             if direct_val:
                 return direct_val
 
-        parts = re.findall(r"(?:__|_)Secure-next-auth\.session-token\.(\d+)=([^;,]*)", text)
+        parts = re.findall(
+            r"(?:__Secure-next-auth\.session-token|_Secure-next-auth\.session-token|next-auth\.session-token|__Secure-authjs\.session-token|_Secure-authjs\.session-token|authjs\.session-token)\.(\d+)=([^;,]*)",
+            text,
+        )
         if not parts:
             return ""
 
@@ -811,6 +839,907 @@ class RegistrationEngine:
             )
         except Exception as e:
             self._log(f"chatgpt 首页预热异常: {e}", "warning")
+
+    def _fetch_auth_session_payload(self) -> Dict[str, Any]:
+        """读取 chatgpt auth/session，给 workspace/session 补充上下文。"""
+        if not self.session:
+            return {}
+        try:
+            response = self.session.get(
+                "https://chatgpt.com/api/auth/session",
+                headers={
+                    "accept": "application/json",
+                    "referer": "https://chatgpt.com/",
+                    "origin": "https://chatgpt.com",
+                    "user-agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                    "cache-control": "no-cache",
+                    "pragma": "no-cache",
+                },
+                timeout=20,
+            )
+            if response.status_code != 200:
+                return {}
+            payload = response.json() or {}
+            return payload if isinstance(payload, dict) else {}
+        except Exception:
+            return {}
+
+    def _wait_for_chatgpt_web_session(
+        self,
+        session_obj,
+        *,
+        timeout: int = 12,
+    ) -> tuple[Dict[str, Any], str]:
+        """
+        对齐 openai_register 的网页登录收尾：
+        重复访问 chatgpt 首页和 /api/auth/session，等待 Web Session Cookie 落地。
+        """
+        if not session_obj:
+            return {}, ""
+
+        deadline = time.time() + max(int(timeout or 1), 1)
+        last_payload: Dict[str, Any] = {}
+        last_token = ""
+        while time.time() < deadline:
+            try:
+                session_obj.get(
+                    "https://chatgpt.com/",
+                    headers={
+                        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "referer": "https://chatgpt.com/",
+                        "user-agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                        ),
+                    },
+                    allow_redirects=True,
+                    timeout=20,
+                )
+            except Exception:
+                pass
+
+            try:
+                response = session_obj.get(
+                    "https://chatgpt.com/api/auth/session",
+                    headers={
+                        "accept": "application/json",
+                        "referer": "https://chatgpt.com/",
+                        "origin": "https://chatgpt.com",
+                        "user-agent": (
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                        ),
+                        "cache-control": "no-cache",
+                        "pragma": "no-cache",
+                    },
+                    timeout=20,
+                )
+                if response.status_code == 200:
+                    try:
+                        payload = response.json() or {}
+                        if isinstance(payload, dict):
+                            last_payload = payload
+                    except Exception:
+                        last_payload = {}
+                last_token = self._extract_session_token_from_auth_response(response, session_obj) or last_token
+            except Exception:
+                pass
+
+            if last_token and isinstance(last_payload, dict):
+                if last_payload.get("accessToken") and last_payload.get("user") and last_payload.get("account"):
+                    return last_payload, last_token
+
+            time.sleep(1)
+
+        if last_token:
+            return last_payload, last_token
+        return last_payload, ""
+
+    @staticmethod
+    def _session_cookie_value(session_obj, name: str, domain_fragment: str = "") -> str:
+        try:
+            jar = getattr(session_obj, "cookies", None)
+            cookie_jar = getattr(jar, "jar", None)
+            if cookie_jar is not None:
+                for cookie in cookie_jar:
+                    if str(getattr(cookie, "name", "") or "") != name:
+                        continue
+                    domain = str(getattr(cookie, "domain", "") or "")
+                    if domain_fragment and domain_fragment not in domain:
+                        continue
+                    return str(getattr(cookie, "value", "") or "")
+        except Exception:
+            pass
+        try:
+            value = session_obj.cookies.get(name)
+            return str(value or "")
+        except Exception:
+            return ""
+
+    def _session_device_id_for_auth(self, session_obj) -> str:
+        return str(
+            self._session_cookie_value(session_obj, "oai-did", ".openai.com")
+            or self._session_cookie_value(session_obj, "oai-did", ".chatgpt.com")
+            or self._session_cookie_value(session_obj, "oai-did")
+            or ""
+        ).strip()
+
+    def _session_has_login_csrf_cookie(self, session_obj) -> bool:
+        try:
+            jar = getattr(getattr(session_obj, "cookies", None), "jar", None)
+            if jar is None:
+                return False
+            return any(str(getattr(cookie, "name", "") or "").startswith("oai-login-csrf") for cookie in jar)
+        except Exception:
+            return False
+
+    def _build_auth_sentinel_header_for_session(self, session_obj, flow: str, device_id: str) -> str:
+        try:
+            response = session_obj.post(
+                OPENAI_API_ENDPOINTS["sentinel"],
+                headers={
+                    "accept": "*/*",
+                    "accept-language": "zh-CN,zh;q=0.9",
+                    "content-type": "text/plain;charset=UTF-8",
+                    "origin": "https://sentinel.openai.com",
+                    "referer": "https://sentinel.openai.com/backend-api/sentinel/frame.html",
+                    "sec-fetch-dest": "empty",
+                    "sec-fetch-mode": "cors",
+                    "sec-fetch-site": "same-origin",
+                    "user-agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                },
+                data=json.dumps({"p": "", "id": device_id, "flow": flow}),
+                timeout=20,
+            )
+            if response.status_code != 200:
+                return ""
+            payload = response.json() or {}
+            token = str((payload or {}).get("token") or "").strip()
+            if not token:
+                return ""
+            return json.dumps(
+                {
+                    "p": "",
+                    "t": "",
+                    "c": token,
+                    "id": device_id,
+                    "flow": flow,
+                }
+            )
+        except Exception:
+            return ""
+
+    def _perform_chatgpt_direct_auth_login(self, session_obj) -> bool:
+        """
+        直接对齐 openai_register 的 _perform_auth_login_flow。
+        这条链路用于 ChatGPT 网页会话，不复用 Codex OAuth 的 callback 状态。
+        """
+        if not session_obj or not self.email:
+            return False
+
+        login_entry_url = "https://auth.openai.com/log-in-or-create-account"
+        device_id = self._session_device_id_for_auth(session_obj)
+        if not device_id:
+            try:
+                session_obj.get(login_entry_url, allow_redirects=True, timeout=20)
+            except Exception:
+                pass
+            device_id = self._session_device_id_for_auth(session_obj)
+        if not device_id:
+            return False
+
+        if not self._session_has_login_csrf_cookie(session_obj):
+            try:
+                session_obj.get(login_entry_url, allow_redirects=True, timeout=20)
+            except Exception:
+                pass
+        if not self._session_has_login_csrf_cookie(session_obj):
+            return False
+
+        authorize_token = self._build_auth_sentinel_header_for_session(
+            session_obj,
+            "authorize_continue",
+            device_id,
+        )
+        if not authorize_token:
+            return False
+
+        authorize_response = session_obj.post(
+            OPENAI_API_ENDPOINTS["signup"],
+            headers={
+                "accept": "application/json",
+                "accept-language": "zh-CN,zh;q=0.9",
+                "content-type": "application/json",
+                "origin": "https://auth.openai.com",
+                "referer": "https://auth.openai.com/log-in",
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+                "openai-sentinel-token": authorize_token,
+            },
+            data=json.dumps(
+                {
+                    "username": {
+                        "kind": "email",
+                        "value": self.email,
+                    }
+                }
+            ),
+            timeout=20,
+        )
+        if authorize_response.status_code != 200:
+            return False
+
+        current_payload = authorize_response.json() or {}
+        page_type = str(((current_payload or {}).get("page") or {}).get("type") or "").strip()
+        otp_requested_at: Optional[float] = None
+
+        if page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
+            otp_response = session_obj.post(
+                "https://auth.openai.com/api/accounts/passwordless/send-otp",
+                headers={
+                    "accept": "application/json",
+                    "accept-language": "zh-CN,zh;q=0.9",
+                    "content-type": "application/json",
+                    "origin": "https://auth.openai.com",
+                    "referer": "https://auth.openai.com/log-in/password",
+                    "sec-fetch-dest": "empty",
+                    "sec-fetch-mode": "cors",
+                    "sec-fetch-site": "same-origin",
+                },
+                timeout=20,
+            )
+            if otp_response.status_code == 200:
+                otp_requested_at = time.time() - 5
+                page_type = OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]
+            else:
+                password_token = self._build_auth_sentinel_header_for_session(
+                    session_obj,
+                    "password_verify",
+                    device_id,
+                )
+                if not password_token or not self.password:
+                    return False
+                password_response = session_obj.post(
+                    OPENAI_API_ENDPOINTS["password_verify"],
+                    headers={
+                        "accept": "application/json",
+                        "accept-language": "zh-CN,zh;q=0.9",
+                        "content-type": "application/json",
+                        "origin": "https://auth.openai.com",
+                        "referer": "https://auth.openai.com/log-in/password",
+                        "sec-fetch-dest": "empty",
+                        "sec-fetch-mode": "cors",
+                        "sec-fetch-site": "same-origin",
+                        "openai-sentinel-token": password_token,
+                    },
+                    data=json.dumps({"password": self.password}),
+                    timeout=20,
+                )
+                if password_response.status_code != 200:
+                    return False
+                current_payload = password_response.json() or {}
+                page_type = str(((current_payload or {}).get("page") or {}).get("type") or "").strip()
+
+        payload, token = self._wait_for_chatgpt_web_session(session_obj, timeout=3)
+        if token and payload.get("accessToken") and payload.get("user") and payload.get("account"):
+            return True
+
+        continue_url = str((current_payload or {}).get("continue_url") or "").strip()
+        if page_type and page_type != OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]:
+            if continue_url:
+                try:
+                    session_obj.get(continue_url, allow_redirects=True, timeout=30)
+                except Exception:
+                    pass
+                payload, token = self._wait_for_chatgpt_web_session(session_obj, timeout=5)
+                if token and payload.get("accessToken") and payload.get("user") and payload.get("account"):
+                    return True
+            return False
+
+        self._otp_sent_at = otp_requested_at or (time.time() - 5)
+        if not self._verify_email_otp_with_retry(stage_label="ChatGPT 网页验证码", max_attempts=3):
+            return False
+        continue_url = str(self._last_validate_otp_continue_url or "").strip()
+        if continue_url:
+            self._visit_continue_url_for_session(continue_url, result=None)
+
+        payload, token = self._wait_for_chatgpt_web_session(session_obj, timeout=12)
+        return bool(token and payload.get("accessToken") and payload.get("user") and payload.get("account"))
+
+    def _visit_continue_url_for_session(self, continue_url: str, result: Optional[RegistrationResult] = None) -> str:
+        """访问 OTP/consent continue_url，促使 auth/session 与 workspace cookie 落地。"""
+        target = str(continue_url or "").strip()
+        if not target or not self.session:
+            return ""
+        if (
+            ("code=" in target)
+            and ("state=" in target)
+            and ("chatgpt.com/api/auth/callback/openai" not in target.lower())
+        ):
+            return target
+
+        try:
+            response = self.session.get(
+                target,
+                headers={
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "referer": "https://auth.openai.com/email-verification",
+                    "origin": "https://auth.openai.com",
+                    "user-agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                    ),
+                },
+                allow_redirects=True,
+                timeout=30,
+            )
+            final_url = str(getattr(response, "url", "") or target).strip()
+            self._log(f"已访问 OTP continue_url，最终 URL: {final_url[:120]}...")
+            if result is not None:
+                self._capture_auth_session_tokens(result, access_hint=result.access_token)
+            return final_url or target
+        except Exception as e:
+            self._log(f"访问 OTP continue_url 失败: {e}", "warning")
+            return target
+
+    @staticmethod
+    def _upsert_cookie_text(cookies_text: Optional[str], cookie_name: str, cookie_value: str) -> str:
+        target_name = str(cookie_name or "").strip()
+        target_value = str(cookie_value or "").strip()
+        if not target_name:
+            return str(cookies_text or "").strip()
+
+        pairs: List[tuple[str, str]] = []
+        seen = False
+        for item in str(cookies_text or "").split(";"):
+            raw = str(item or "").strip()
+            if not raw or "=" not in raw:
+                continue
+            name, value = raw.split("=", 1)
+            name = str(name or "").strip()
+            value = str(value or "").strip()
+            if not name:
+                continue
+            if name == target_name:
+                seen = True
+                if target_value:
+                    pairs.append((name, target_value))
+            else:
+                pairs.append((name, value))
+
+        if (not seen) and target_value:
+            pairs.append((target_name, target_value))
+        return "; ".join(f"{key}={value}" for key, value in pairs if key)
+
+    @staticmethod
+    def _seed_cookie_jar_from_text(session_obj, cookies_text: Optional[str]) -> None:
+        text = str(cookies_text or "").strip()
+        if not text:
+            return
+        for item in text.split(";"):
+            raw = str(item or "").strip()
+            if not raw or "=" not in raw:
+                continue
+            name, value = raw.split("=", 1)
+            key = str(name or "").strip()
+            val = str(value or "").strip()
+            if not key:
+                continue
+            for domain in (".chatgpt.com", "chatgpt.com", ".openai.com", "auth.openai.com"):
+                try:
+                    session_obj.cookies.set(key, val, domain=domain, path="/")
+                except Exception:
+                    continue
+
+    def _extract_session_token_from_auth_response(self, response, session_obj) -> str:
+        token = self._extract_session_token_from_cookie_jar(getattr(response, "cookies", None))
+        if token:
+            return token
+        token = self._extract_session_token_from_cookie_jar(getattr(session_obj, "cookies", None))
+        if token:
+            return token
+        return self._extract_session_token_from_cookie_text(self._flatten_set_cookie_headers(response))
+
+    @staticmethod
+    def _extract_access_token_from_session_payload(payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        return str(payload.get("accessToken") or "").strip()
+
+    def _run_chatgpt_nextauth_bridge(
+        self,
+        session_obj,
+        *,
+        email: str,
+        device_id: str,
+        log_prefix: str,
+    ) -> tuple[str, str]:
+        """走一遍 chatgpt csrf -> signin/openai -> authorize，用于补 next-auth 会话。"""
+        if not session_obj:
+            return "", ""
+
+        normalized_email = str(email or "").strip()
+        normalized_did = str(device_id or "").strip()
+        if not normalized_email:
+            self._log(f"{log_prefix}缺少邮箱，跳过 next-auth 会话桥接", "warning")
+            return "", ""
+        if not normalized_did:
+            normalized_did = str(uuid.uuid4())
+
+        ua = (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        )
+        try:
+            for domain in (".chatgpt.com", "chatgpt.com"):
+                try:
+                    session_obj.cookies.set("oai-did", normalized_did, domain=domain, path="/")
+                except Exception:
+                    continue
+            csrf_resp = session_obj.get(
+                "https://chatgpt.com/api/auth/csrf",
+                headers={
+                    "accept": "*/*",
+                    "accept-language": "zh-CN,zh;q=0.9",
+                    "content-type": "application/json",
+                    "referer": "https://chatgpt.com/",
+                    "origin": "https://chatgpt.com",
+                    "sec-fetch-dest": "empty",
+                    "sec-fetch-mode": "cors",
+                    "sec-fetch-site": "same-origin",
+                    "user-agent": ua,
+                },
+                timeout=30,
+            )
+            if csrf_resp.status_code != 200:
+                self._log(f"{log_prefix}csrf 获取失败: HTTP {csrf_resp.status_code}", "warning")
+                return "", ""
+            csrf_token = str((csrf_resp.json() or {}).get("csrfToken") or "").strip()
+            if not csrf_token:
+                self._log(f"{log_prefix}csrf token 为空，跳过会话桥接", "warning")
+                return "", ""
+
+            signin_resp = session_obj.post(
+                "https://chatgpt.com/api/auth/signin/openai",
+                headers={
+                    "accept": "*/*",
+                    "accept-language": "zh-CN,zh;q=0.9",
+                    "content-type": "application/x-www-form-urlencoded",
+                    "referer": "https://chatgpt.com/",
+                    "origin": "https://chatgpt.com",
+                    "sec-fetch-dest": "empty",
+                    "sec-fetch-mode": "cors",
+                    "sec-fetch-site": "same-origin",
+                    "user-agent": ua,
+                },
+                params={
+                    "prompt": "login",
+                    "ext-oai-did": normalized_did,
+                    "auth_session_logging_id": uuid.uuid4().hex,
+                    "ext-passkey-client-capabilities": "1111",
+                    "screen_hint": "login_or_signup",
+                    "login_hint": normalized_email,
+                },
+                data={
+                    "callbackUrl": "https://chatgpt.com/",
+                    "csrfToken": csrf_token,
+                    "json": "true",
+                },
+                timeout=30,
+            )
+            if signin_resp.status_code != 200:
+                self._log(f"{log_prefix}signin/openai 失败: HTTP {signin_resp.status_code}", "warning")
+                return "", ""
+            auth_url = str((signin_resp.json() or {}).get("url") or "").strip()
+            if not auth_url:
+                self._log(f"{log_prefix}signin/openai 未返回 auth_url", "warning")
+                return "", ""
+
+            response = session_obj.get(
+                auth_url,
+                headers={
+                    "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                    "accept-language": "zh-CN,zh;q=0.9",
+                    "referer": "https://chatgpt.com/",
+                    "user-agent": ua,
+                },
+                allow_redirects=True,
+                timeout=30,
+            )
+            final_url = str(getattr(response, "url", "") or auth_url).strip()
+            self._log(f"{log_prefix}next-auth 会话桥接完成，最终 URL: {final_url[:120]}...")
+            return auth_url, final_url
+        except Exception as e:
+            self._log(f"{log_prefix}next-auth 会话桥接异常: {e}", "warning")
+            return "", ""
+
+    def _force_fetch_nextauth_session_token(self, result: RegistrationResult) -> bool:
+        """使用独立 curl_cffi 会话强制补齐 next-auth session_token，再合并回当前会话。"""
+        base_cookies = self._dump_session_cookies()
+        access_token = str(result.access_token or "").strip()
+        email = str(result.email or self.email or "").strip()
+        device_id = str(result.device_id or self.device_id or "").strip()
+        if not base_cookies and not access_token:
+            return False
+
+        fresh_session = cffi_requests.Session(
+            impersonate="chrome120",
+            proxy=self.proxy_url,
+        )
+        self._seed_cookie_jar_from_text(fresh_session, base_cookies)
+        if device_id:
+            for domain in (".chatgpt.com", "chatgpt.com", ".openai.com", "auth.openai.com"):
+                try:
+                    fresh_session.cookies.set("oai-did", device_id, domain=domain, path="/")
+                except Exception:
+                    continue
+
+        def _request_auth_session(current_access: str) -> tuple[str, str]:
+            headers = {
+                "accept": "application/json",
+                "referer": "https://chatgpt.com/",
+                "origin": "https://chatgpt.com",
+                "user-agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+                ),
+            }
+            latest_access = str(current_access or "").strip()
+            if latest_access:
+                headers["authorization"] = f"Bearer {latest_access}"
+
+            try:
+                fresh_session.get(
+                    "https://chatgpt.com/",
+                    headers={
+                        "accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                        "referer": "https://chatgpt.com/",
+                        "user-agent": headers["user-agent"],
+                    },
+                    timeout=20,
+                )
+            except Exception:
+                pass
+
+            for _ in range(2):
+                response = fresh_session.get(
+                    "https://chatgpt.com/api/auth/session",
+                    headers=headers,
+                    timeout=25,
+                )
+                token = self._extract_session_token_from_auth_response(response, fresh_session)
+                try:
+                    payload = response.json() if getattr(response, "content", None) else {}
+                except Exception:
+                    payload = {}
+                payload_access = self._extract_access_token_from_session_payload(payload)
+                if payload_access:
+                    latest_access = payload_access
+                    headers["authorization"] = f"Bearer {payload_access}"
+                if token:
+                    return token, latest_access
+            return "", latest_access
+
+        session_token, latest_access = _request_auth_session(access_token)
+        if not session_token:
+            self._run_chatgpt_nextauth_bridge(
+                fresh_session,
+                email=email,
+                device_id=device_id,
+                log_prefix="强制补会话(独立会话): ",
+            )
+            session_token, latest_access = _request_auth_session(latest_access or access_token)
+
+        if not session_token:
+            return False
+
+        merged_cookies = base_cookies
+        try:
+            for name, value in list(fresh_session.cookies.items()):
+                key = str(name or "").strip()
+                val = str(value or "").strip()
+                if not key or not val:
+                    continue
+                merged_cookies = self._upsert_cookie_text(merged_cookies, key, val)
+        except Exception:
+            pass
+        merged_cookies = self._upsert_cookie_text(merged_cookies, "__Secure-next-auth.session-token", session_token)
+        if device_id:
+            merged_cookies = self._upsert_cookie_text(merged_cookies, "oai-did", device_id)
+
+        if self.session:
+            self._seed_cookie_jar_from_text(self.session, merged_cookies)
+        self.session_token = session_token
+        result.session_token = session_token
+        if latest_access:
+            result.access_token = latest_access
+        self._log(f"独立会话补抓 session_token 成功（len={len(session_token)}）")
+        return True
+
+    def _complete_chatgpt_bridge_stage(self, result: RegistrationResult, *, final_url: str, log_prefix: str) -> bool:
+        """
+        ChatGPT 桥接后优先利用当前落点继续走密码/OTP，而不是盲目重新 authorize_continue。
+        这样可以显著降低 429 限流概率。
+        """
+        current_url = str(final_url or "").strip().lower()
+        if not current_url:
+            return False
+
+        if "auth.openai.com/email-verification" in current_url:
+            self._log(f"{log_prefix}已直达邮箱验证码页，直接提交 OTP...")
+        elif "auth.openai.com/log-in/password" in current_url:
+            self._log(f"{log_prefix}已直达密码页，先提交密码再继续...")
+            password_result = self._submit_login_password()
+            if not password_result.success:
+                self._log(f"{log_prefix}提交密码失败: {password_result.error_message}", "warning")
+                return False
+            page_type = str(password_result.page_type or "").strip()
+            if page_type != OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]:
+                self._log(f"{log_prefix}提交密码后未进入邮箱验证码页: {page_type or 'unknown'}", "warning")
+                return False
+        else:
+            return False
+
+        if not self._verify_email_otp_with_retry(stage_label=f"{log_prefix}验证码", max_attempts=2):
+            self._log(f"{log_prefix}验证码校验失败", "warning")
+            return False
+
+        continue_url = str(self._last_validate_otp_continue_url or "").strip()
+        if continue_url:
+            self._visit_continue_url_for_session(continue_url, result=result)
+
+        self._warmup_chatgpt_session()
+        if self._capture_auth_session_tokens(result, access_hint=result.access_token):
+            return True
+
+        fallback = self._extract_session_token_from_cookie_text(self._dump_session_cookies())
+        if fallback:
+            self.session_token = fallback
+            result.session_token = fallback
+            return True
+        return False
+
+    def _bootstrap_session_token_via_chatgpt_full_login(self, result: RegistrationResult) -> bool:
+        """
+        用独立会话从 ChatGPT 入口完整登录一次，只为了建立 next-auth session。
+        参考 openai_register 的 chatgpt_login_tool 路径。
+        """
+        if not self.email or not self.password:
+            return False
+
+        original_session = self.session
+        original_device_id = self.device_id
+        original_otp_sent_at = self._otp_sent_at
+        original_continue = self._last_validate_otp_continue_url
+        original_workspace = self._last_validate_otp_workspace_id
+
+        temp_session = cffi_requests.Session(
+            impersonate="chrome120",
+            proxy=self.proxy_url,
+        )
+        base_cookies = self._dump_session_cookies()
+        self._seed_cookie_jar_from_text(temp_session, base_cookies)
+        temp_device_id = str(result.device_id or self.device_id or uuid.uuid4()).strip()
+
+        try:
+            auth_url, final_url = self._run_chatgpt_nextauth_bridge(
+                temp_session,
+                email=str(self.email or "").strip(),
+                device_id=temp_device_id,
+                log_prefix="会话补全(完整登录): ",
+            )
+            if not auth_url:
+                return False
+
+            self.session = temp_session
+            self.device_id = temp_device_id
+            self._last_validate_otp_continue_url = None
+            self._last_validate_otp_workspace_id = None
+            self._otp_sent_at = None
+
+            if self._complete_chatgpt_bridge_stage(
+                result,
+                final_url=final_url,
+                log_prefix="会话补全(完整登录)",
+            ):
+                pass
+            else:
+                sen_token = self._check_sentinel(temp_device_id)
+                login_start_result = self._submit_login_start(temp_device_id, sen_token)
+                if not login_start_result.success:
+                    self._log(
+                        f"会话补全(完整登录)入口失败: {login_start_result.error_message}",
+                        "warning",
+                    )
+                    return False
+                page_type = str(login_start_result.page_type or "").strip()
+                if page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
+                    password_result = self._submit_login_password()
+                    if not password_result.success:
+                        self._log(
+                            f"会话补全(完整登录)提交密码失败: {password_result.error_message}",
+                            "warning",
+                        )
+                        return False
+                    page_type = str(password_result.page_type or "").strip()
+
+                if page_type != OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]:
+                    continue_url = str((login_start_result.response_data or {}).get("continue_url") or "").strip()
+                    if continue_url:
+                        self._visit_continue_url_for_session(continue_url, result=result)
+                    return bool(result.session_token)
+
+                if not self._verify_email_otp_with_retry(stage_label="会话补全登录验证码", max_attempts=2):
+                    self._log("会话补全(完整登录)验证码校验失败", "warning")
+                    return False
+
+                continue_url = str(self._last_validate_otp_continue_url or "").strip()
+                if continue_url:
+                    self._visit_continue_url_for_session(continue_url, result=result)
+
+                self._warmup_chatgpt_session()
+                if self._capture_auth_session_tokens(result, access_hint=result.access_token):
+                    pass
+
+            if not result.session_token:
+                cookie_text = self._dump_session_cookies()
+                fallback = self._extract_session_token_from_cookie_text(cookie_text)
+                if fallback:
+                    result.session_token = fallback
+                    self.session_token = fallback
+
+            if not result.session_token:
+                return False
+
+            merged_cookies = base_cookies
+            try:
+                for name, value in list(temp_session.cookies.items()):
+                    key = str(name or "").strip()
+                    val = str(value or "").strip()
+                    if not key or not val:
+                        continue
+                    merged_cookies = self._upsert_cookie_text(merged_cookies, key, val)
+            except Exception:
+                pass
+            merged_cookies = self._upsert_cookie_text(merged_cookies, "__Secure-next-auth.session-token", result.session_token)
+            merged_cookies = self._upsert_cookie_text(merged_cookies, "oai-did", temp_device_id)
+
+            if original_session:
+                self._seed_cookie_jar_from_text(original_session, merged_cookies)
+            self._log(f"会话补全(完整登录)成功，session_token 已补齐（len={len(str(result.session_token or ''))}）")
+            return True
+        except Exception as e:
+            self._log(f"会话补全(完整登录)异常: {e}", "warning")
+            return False
+        finally:
+            self.session = original_session
+            self.device_id = original_device_id
+            self._otp_sent_at = original_otp_sent_at
+            self._last_validate_otp_continue_url = original_continue
+            self._last_validate_otp_workspace_id = original_workspace
+
+    def _bootstrap_chatgpt_web_session_direct(self, result: RegistrationResult) -> bool:
+        """
+        用一条全新的 ChatGPT 网页登录链路直接补齐 Web Session Cookie。
+        这是 openai_register 已验证可用的 curl_cffi 路径，优先避免在 Codex OAuth 回调链里反复重放导致 429。
+        """
+        if not self.email or not self.password:
+            return False
+
+        original_session = self.session
+        original_device_id = self.device_id
+        original_otp_sent_at = self._otp_sent_at
+        original_continue = self._last_validate_otp_continue_url
+        original_workspace = self._last_validate_otp_workspace_id
+        base_cookies = self._dump_session_cookies()
+
+        temp_session = cffi_requests.Session(
+            impersonate="chrome120",
+            proxy=self.proxy_url,
+        )
+
+        try:
+            self.session = temp_session
+            self.device_id = ""
+            self._otp_sent_at = None
+            self._last_validate_otp_continue_url = None
+            self._last_validate_otp_workspace_id = None
+
+            auth_url, final_url = self._run_chatgpt_nextauth_bridge(
+                temp_session,
+                email=str(self.email or "").strip(),
+                device_id=str(uuid.uuid4()),
+                log_prefix="ChatGPT 网页补会话: ",
+            )
+            if not auth_url:
+                return False
+
+            final_url_lower = str(final_url or "").strip().lower()
+            if "email-verification" in final_url_lower:
+                self._log("ChatGPT 网页补会话已直达邮箱验证码页，直接继续...", "warning")
+                self._otp_sent_at = time.time() - 5
+                if not self._verify_email_otp_with_retry(stage_label="ChatGPT 网页验证码", max_attempts=3):
+                    return False
+                continue_url = str(self._last_validate_otp_continue_url or "").strip()
+                if continue_url:
+                    self._visit_continue_url_for_session(continue_url, result=None)
+            else:
+                payload, token = self._wait_for_chatgpt_web_session(temp_session, timeout=5)
+                if token:
+                    self.session_token = token
+                    result.session_token = token
+                    payload_access = self._extract_access_token_from_session_payload(payload)
+                    if payload_access and not result.access_token:
+                        result.access_token = payload_access
+                    if isinstance(payload, dict):
+                        account_payload = payload.get("account") or {}
+                        if isinstance(account_payload, dict):
+                            workspace_id = str(
+                                account_payload.get("workspace_id")
+                                or account_payload.get("workspaceId")
+                                or account_payload.get("id")
+                                or ""
+                            ).strip()
+                            if workspace_id and not result.workspace_id:
+                                result.workspace_id = workspace_id
+                    return True
+
+                self._log("ChatGPT 网页补会话未直达可用状态，改走 reference 风格的网页登录链路...", "warning")
+                if not self._perform_chatgpt_direct_auth_login(temp_session):
+                    return False
+
+            payload, token = self._wait_for_chatgpt_web_session(temp_session, timeout=12)
+            if not token:
+                return False
+
+            self.session_token = token
+            result.session_token = token
+            payload_access = self._extract_access_token_from_session_payload(payload)
+            if payload_access and not result.access_token:
+                result.access_token = payload_access
+            if isinstance(payload, dict):
+                account_payload = payload.get("account") or {}
+                if isinstance(account_payload, dict):
+                    workspace_id = str(
+                        account_payload.get("workspace_id")
+                        or account_payload.get("workspaceId")
+                        or account_payload.get("id")
+                        or ""
+                    ).strip()
+                    if workspace_id and not result.workspace_id:
+                        result.workspace_id = workspace_id
+
+            merged_cookies = base_cookies
+            try:
+                for name, value in list(temp_session.cookies.items()):
+                    key = str(name or "").strip()
+                    val = str(value or "").strip()
+                    if not key or not val:
+                        continue
+                    merged_cookies = self._upsert_cookie_text(merged_cookies, key, val)
+            except Exception:
+                pass
+
+            if original_session:
+                self._seed_cookie_jar_from_text(original_session, merged_cookies)
+            self._log(f"ChatGPT 网页补会话成功，session_token 已补齐（len={len(token)}）")
+            return True
+        except Exception as e:
+            self._log(f"ChatGPT 网页补会话异常: {e}", "warning")
+            return False
+        finally:
+            self.session = original_session
+            self.device_id = original_device_id
+            self._otp_sent_at = original_otp_sent_at
+            self._last_validate_otp_continue_url = original_continue
+            self._last_validate_otp_workspace_id = original_workspace
 
     def _capture_auth_session_tokens(self, result: RegistrationResult, access_hint: Optional[str] = None) -> bool:
         """
@@ -946,72 +1875,24 @@ class RegistrationEngine:
         """
         self._log("Session Token 还没就位，尝试 ABCard 同款会话桥接...")
         self._warmup_chatgpt_session()
-        csrf_token = ""
-        auth_url = ""
-        try:
-            csrf_resp = self.session.get(
-                "https://chatgpt.com/api/auth/csrf",
-                headers={
-                    "accept": "application/json",
-                    "referer": "https://chatgpt.com/auth/login",
-                    "origin": "https://chatgpt.com",
-                    "user-agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-                    ),
-                },
-                timeout=20,
-            )
-            if csrf_resp.status_code == 200:
-                csrf_token = str((csrf_resp.json() or {}).get("csrfToken") or "").strip()
-            else:
-                self._log(f"csrf 获取失败: HTTP {csrf_resp.status_code}", "warning")
-        except Exception as e:
-            self._log(f"csrf 获取异常: {e}", "warning")
-
-        if not csrf_token:
-            self._log("csrf token 为空，跳过会话桥接", "warning")
-            return False
-
-        try:
-            signin_resp = self.session.post(
-                "https://chatgpt.com/api/auth/signin/openai",
-                headers={
-                    "accept": "application/json",
-                    "content-type": "application/x-www-form-urlencoded",
-                    "origin": "https://chatgpt.com",
-                    "referer": "https://chatgpt.com/auth/login",
-                    "user-agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-                    ),
-                },
-                data={
-                    "csrfToken": csrf_token,
-                    "callbackUrl": "https://chatgpt.com/",
-                    "json": "true",
-                },
-                timeout=20,
-            )
-            if signin_resp.status_code == 200:
-                auth_url = str((signin_resp.json() or {}).get("url") or "").strip()
-            else:
-                self._log(f"signin/openai 失败: HTTP {signin_resp.status_code}", "warning")
-        except Exception as e:
-            self._log(f"signin/openai 异常: {e}", "warning")
-
+        did = str(self.device_id or self.session.cookies.get("oai-did") or "").strip()
+        if not did:
+            did = str(uuid.uuid4())
+        auth_url, final_url = self._run_chatgpt_nextauth_bridge(
+            self.session,
+            email=str(self.email or result.email or "").strip(),
+            device_id=did,
+            log_prefix="会话桥接: ",
+        )
         if not auth_url:
-            self._log("signin/openai 未返回 auth_url，跳过会话桥接", "warning")
             return False
 
         callback_url = ""
-        final_url = auth_url
         try:
             callback_url, final_url = self._follow_chatgpt_auth_redirects(auth_url)
         except Exception as e:
             self._log(f"会话桥接重定向跟踪异常: {e}", "warning")
             callback_url = ""
-            final_url = auth_url
 
         # 若已拿到 callback，补打一跳确保 next-auth callback 被完整执行。
         if callback_url and "error=" not in callback_url:
@@ -1033,11 +1914,18 @@ class RegistrationEngine:
                 self._log(f"会话桥接 callback 补跳异常: {e}", "warning")
         elif callback_url and "error=" in callback_url:
             self._log(f"会话桥接回调返回错误参数: {callback_url[:140]}...", "warning")
+            if self._complete_chatgpt_bridge_stage(result, final_url=final_url, log_prefix="会话桥接"):
+                return True
+            if self.email and self.password:
+                self._log("会话桥接回调异常，直接转完整登录补会话...")
+                if self._bridge_login_for_session_token(result):
+                    return True
         else:
             self._log(f"会话桥接未命中 callback，final_url={final_url[:120]}...", "warning")
-            # 命中 auth.openai 登录页时，尝试自动登录补会话（对齐 ABCard 的登录态建立思路）。
-            if "auth.openai.com/log-in" in str(final_url or "").lower():
-                self._log("会话桥接进入登录页，尝试自动登录后继续抓取 session_token...")
+            if self._complete_chatgpt_bridge_stage(result, final_url=final_url, log_prefix="会话桥接"):
+                return True
+            if self.email and self.password:
+                self._log("会话桥接未完成，直接转完整登录补会话...")
                 if self._bridge_login_for_session_token(result):
                     return True
 
@@ -1418,6 +2306,13 @@ class RegistrationEngine:
                 result.error_message = "验证码校验失败"
                 return False
 
+        otp_continue = str(self._last_validate_otp_continue_url or "").strip()
+        if otp_continue:
+            visited_url = self._visit_continue_url_for_session(otp_continue, result=result)
+            if visited_url:
+                self._last_validate_otp_continue_url = visited_url
+                otp_continue = visited_url
+
         self._log("摸一下 Workspace ID，看看该坐哪桌...")
         workspace_id = str(self._last_validate_otp_workspace_id or "").strip()
         if workspace_id:
@@ -1428,7 +2323,6 @@ class RegistrationEngine:
             result.workspace_id = workspace_id
 
         continue_url = ""
-        otp_continue = str(self._last_validate_otp_continue_url or "").strip()
         if otp_continue and _is_registration_gate_url(otp_continue):
             self._log("OTP 返回 continue_url 指向注册门页（about-you/add-phone），本轮收尾忽略该地址", "warning")
             otp_continue = ""
@@ -1652,7 +2546,8 @@ class RegistrationEngine:
         """
         强制确保 session_token 可用。
         - 先走 auth/session 直抓
-        - 再走 ABCard 同款会话桥接
+        - 再走 direct ChatGPT 网页登录补会话
+        - 最后才走旧的桥接/独立会话兜底
         连续多轮失败则返回 False。
         """
         if result.session_token:
@@ -1668,9 +2563,21 @@ class RegistrationEngine:
                 self._log("强制补会话成功：auth/session 已拿到 session_token")
                 return True
 
+            if self._bootstrap_chatgpt_web_session_direct(result):
+                self._log("强制补会话成功：direct ChatGPT 网页登录已拿到 session_token")
+                return True
+
+            if self._bootstrap_session_token_via_chatgpt_full_login(result):
+                self._log("强制补会话成功：完整登录链路已拿到 session_token")
+                return True
+
             self._bootstrap_chatgpt_signin_for_session(result)
             if result.session_token:
                 self._log("强制补会话成功：桥接链路已拿到 session_token")
+                return True
+
+            if self._force_fetch_nextauth_session_token(result):
+                self._log("强制补会话成功：独立会话已拿到 session_token")
                 return True
 
             fallback_token = self._extract_session_token_from_cookie_text(self._dump_session_cookies())
@@ -2287,17 +3194,78 @@ class RegistrationEngine:
     def _create_user_account(self) -> bool:
         """创建用户账户"""
         try:
+            did = str(self.device_id or "").strip()
+            if not did:
+                did = str(self._get_device_id() or "").strip()
+            if not did:
+                self._log("账户创建失败: 缺少 Device ID", "warning")
+                return False
+
+            about_you_url = str(
+                self._last_validate_otp_continue_url
+                or self._create_account_continue_url
+                or "https://auth.openai.com/about-you"
+            ).strip()
+            if not about_you_url.startswith("https://auth.openai.com/"):
+                about_you_url = "https://auth.openai.com/about-you"
+
+            create_sentinel_payload = self.http_client.check_sentinel(
+                did,
+                flow="oauth_create_account",
+                include_pow=False,
+                return_payload=True,
+            ) or {}
+            if not isinstance(create_sentinel_payload, dict):
+                create_sentinel_payload = {"token": str(create_sentinel_payload or "").strip()}
+
+            create_sentinel_token = str(create_sentinel_payload.get("token") or "").strip()
+            create_so_token = str(create_sentinel_payload.get("so_token") or "").strip()
+            if not create_sentinel_token:
+                self._log("账户创建失败: create_account Sentinel token 获取失败", "warning")
+                return False
+
+            self._log("create_account Sentinel token 获取成功")
             user_info = generate_random_user_info()
             self._log(f"生成用户信息: {user_info['name']}, 生日: {user_info['birthdate']}")
-            create_account_body = json.dumps(user_info)
+            create_account_body = json.dumps(user_info, separators=(",", ":"))
+            create_sentinel = json.dumps({
+                "p": "",
+                "t": "",
+                "c": create_sentinel_token,
+                "id": did,
+                "flow": "oauth_create_account",
+            }, separators=(",", ":"))
+            create_so_sentinel = (
+                json.dumps({
+                    "so": create_so_token,
+                    "c": create_sentinel_token,
+                    "id": did,
+                    "flow": "oauth_create_account",
+                }, separators=(",", ":"))
+                if create_so_token
+                else None
+            )
+
+            create_account_headers = {
+                "referer": about_you_url,
+                "origin": "https://auth.openai.com",
+                "accept": "application/json",
+                "accept-language": "zh-CN,zh;q=0.9",
+                "content-type": "application/json",
+                "sec-ch-ua": '"Chromium";v="146", "Not-A.Brand";v="24", "Google Chrome";v="146"',
+                "sec-ch-ua-mobile": "?0",
+                "sec-ch-ua-platform": '"macOS"',
+                "sec-fetch-dest": "empty",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-site": "same-origin",
+                "openai-sentinel-token": create_sentinel,
+            }
+            if create_so_sentinel:
+                create_account_headers["openai-sentinel-so-token"] = create_so_sentinel
 
             response = self.session.post(
                 OPENAI_API_ENDPOINTS["create_account"],
-                headers={
-                    "referer": "https://auth.openai.com/about-you",
-                    "accept": "application/json",
-                    "content-type": "application/json",
-                },
+                headers=create_account_headers,
                 data=create_account_body,
             )
 
@@ -2354,15 +3322,35 @@ class RegistrationEngine:
                     return ""
                 workspace_id = str(
                     payload.get("workspace_id")
+                    or payload.get("workspaceId")
                     or payload.get("default_workspace_id")
+                    or payload.get("defaultWorkspaceId")
                     or ((payload.get("workspace") or {}).get("id") if isinstance(payload.get("workspace"), dict) else "")
                     or ""
                 ).strip()
                 if workspace_id:
                     return workspace_id
+                organizations = payload.get("organizations") or []
+                if isinstance(organizations, list):
+                    for item in organizations:
+                        if not isinstance(item, dict):
+                            continue
+                        organization_id = str(item.get("id") or "").strip()
+                        if organization_id:
+                            return organization_id
                 workspaces = payload.get("workspaces") or []
                 if isinstance(workspaces, list) and workspaces:
                     return str((workspaces[0] or {}).get("id") or "").strip()
+                account_payload = payload.get("account")
+                if isinstance(account_payload, dict):
+                    nested_workspace_id = _extract_workspace_id(account_payload)
+                    if nested_workspace_id:
+                        return nested_workspace_id
+                auth_payload = payload.get("https://api.openai.com/auth")
+                if isinstance(auth_payload, dict):
+                    nested_workspace_id = _extract_workspace_id(auth_payload)
+                    if nested_workspace_id:
+                        return nested_workspace_id
                 return ""
 
             auth_cookie = str(self.session.cookies.get("oai-client-auth-session") or "").strip()
@@ -2424,6 +3412,13 @@ class RegistrationEngine:
                     except Exception as auth_info_err:
                         self._log(f"解析 auth-info Cookie 失败: {auth_info_err}", "warning")
 
+                session_payload = self._fetch_auth_session_payload()
+                if session_payload:
+                    workspace_id = _extract_workspace_id(session_payload)
+                    if workspace_id:
+                        self._log(f"Workspace ID (auth/session): {workspace_id}")
+                        return workspace_id
+
                 # 兜底：复用 create_account 缓存
                 cached_workspace = str(self._create_account_workspace_id or "").strip()
                 if cached_workspace:
@@ -2445,11 +3440,16 @@ class RegistrationEngine:
         """选择 Workspace"""
         try:
             select_body = f'{{"workspace_id":"{workspace_id}"}}'
+            referer = str(
+                self._last_validate_otp_continue_url
+                or self._create_account_continue_url
+                or "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+            ).strip()
 
             response = self.session.post(
                 OPENAI_API_ENDPOINTS["select_workspace"],
                 headers={
-                    "referer": "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+                    "referer": referer,
                     "content-type": "application/json",
                     "accept": "application/json",
                 },
@@ -2730,6 +3730,18 @@ class RegistrationEngine:
             else:
                 use_abcard_entry = (effective_entry_flow == "abcard") and (not self._is_existing_account)
                 if not self._complete_token_exchange(result, require_login_otp=not use_abcard_entry):
+                    return result
+
+            if result.access_token and not result.session_token:
+                self._log("OAuth token 已到手，但 session_token 仍缺失，启动补会话收尾...", "warning")
+                strict_ok = self._ensure_session_token_strict(
+                    result,
+                    max_rounds=2 if effective_entry_flow == "native" else 1,
+                )
+                if strict_ok:
+                    self._log("补会话收尾完成，session_token 已补齐")
+                elif effective_entry_flow != "native":
+                    result.error_message = "未获取到 session_token（收尾补会话失败）"
                     return result
 
             # 10. 完成

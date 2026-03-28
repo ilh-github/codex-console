@@ -56,3 +56,5 @@ Thumbs.db
 # Project specific
 backups/
 /out/
+start.sh
+.runtime/webui.pid

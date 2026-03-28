@@ -253,6 +253,38 @@ def test_get_verification_code_fetches_mail_detail_when_list_has_no_body():
     assert code == "246810"
 
 
+def test_extract_otp_code_ignores_digits_inside_email_address():
+    service = TempMailService({
+        "base_url": "https://mail.example.com",
+        "admin_password": "admin-secret",
+        "domain": "example.com",
+    })
+
+    code, semantic_hit = service._extract_otp_code(
+        "To: usery2kfgelx796538@hteg1.xyz\nOpenAI verification pending",
+        r"(?<!\d)(\d{6})(?!\d)",
+    )
+
+    assert code is None
+    assert semantic_hit is False
+
+
+def test_extract_otp_code_prefers_real_code_over_email_localpart_digits():
+    service = TempMailService({
+        "base_url": "https://mail.example.com",
+        "admin_password": "admin-secret",
+        "domain": "example.com",
+    })
+
+    code, semantic_hit = service._extract_otp_code(
+        "To: usery2kfgelx796538@hteg1.xyz\nYour OpenAI verification code is 123456",
+        r"(?<!\d)(\d{6})(?!\d)",
+    )
+
+    assert code == "123456"
+    assert semantic_hit is False
+
+
 def test_get_verification_code_admin_unfiltered_fallback():
     service = TempMailService({
         "base_url": "https://mail.example.com",
