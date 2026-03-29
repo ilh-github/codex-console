@@ -2339,12 +2339,12 @@ class RegistrationEngine:
 
         continue_url = ""
         if otp_continue and _is_registration_gate_url(otp_continue):
-            self._log("OTP 返回 continue_url 指向注册门页（about-you/add-phone），本轮收尾忽略该地址", "warning")
+            self._log("OTP 返回 continue_url 指向注册门页（about-you/add-phone），本轮收尾忽略该地址")
             otp_continue = ""
 
         cached_continue = str(self._create_account_continue_url or "").strip()
         if cached_continue and _is_registration_gate_url(cached_continue):
-            self._log("create_account 缓存 continue_url 指向注册门页（about-you/add-phone），本轮收尾忽略该地址", "warning")
+            self._log("create_account 缓存 continue_url 指向注册门页（about-you/add-phone），本轮收尾忽略该地址")
             cached_continue = ""
 
         if workspace_id:
@@ -3455,7 +3455,7 @@ class RegistrationEngine:
             try:
                 auth_info_json = json.loads(auth_info_text)
             except Exception as auth_info_err:
-                self._log(f"解析 auth-info Cookie 失败: {auth_info_err}", "warning")
+                self._log(f"解析 auth-info Cookie 失败: {auth_info_err}")
             else:
                 if isinstance(auth_info_json, dict):
                     yield auth_info_json
