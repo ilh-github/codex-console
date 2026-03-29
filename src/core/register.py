@@ -3,6 +3,7 @@
 从 main.py 中提取并重构的注册流程
 """
 
+import base64
 import re
 import json
 import time
@@ -35,6 +36,18 @@ from ..config.settings import get_settings
 
 
 logger = logging.getLogger(__name__)
+
+CONSENT_WORKSPACE_PATTERNS = (
+    r'"workspace_id"\s*:\s*"([^"]+)"',
+    r'"workspaceId"\s*:\s*"([^"]+)"',
+    r'"default_workspace_id"\s*:\s*"([^"]+)"',
+    r'"defaultWorkspaceId"\s*:\s*"([^"]+)"',
+    r'"workspaces"\s*:\s*\[\s*\{\s*"id"\s*:\s*"([^"]+)"',
+)
+CONSENT_ACCOUNT_PATTERNS = (
+    r'"account_id"\s*:\s*"([^"]+)"',
+    r'"accountId"\s*:\s*"([^"]+)"',
+)
 
 
 @dataclass
@@ -2017,9 +2030,10 @@ class RegistrationEngine:
             if not workspace_id:
                 self._log("会话桥接自动登录未获取到 workspace_id", "warning")
                 return False
-            result.workspace_id = workspace_id
-
-            continue_url = self._select_workspace(workspace_id)
+            selected_workspace_id, continue_url = self._select_workspace_for_current_session(
+                preferred_workspace_id=workspace_id,
+            )
+            result.workspace_id = str(selected_workspace_id or workspace_id).strip()
             if not continue_url:
                 cached_continue = str(self._create_account_continue_url or "").strip()
                 if cached_continue:
@@ -2136,10 +2150,11 @@ class RegistrationEngine:
         workspace_id = self._get_workspace_id()
         continue_url = ""
         if workspace_id:
-            result.workspace_id = workspace_id
-
             self._log("选择 Workspace，安排个靠谱座位...")
-            continue_url = self._select_workspace(workspace_id)
+            selected_workspace_id, continue_url = self._select_workspace_for_current_session(
+                preferred_workspace_id=workspace_id,
+            )
+            result.workspace_id = str(selected_workspace_id or workspace_id).strip()
             if not continue_url:
                 cached_continue = str(self._create_account_continue_url or "").strip()
                 if cached_continue:
@@ -2334,7 +2349,14 @@ class RegistrationEngine:
 
         if workspace_id:
             self._log("选择 Workspace，安排个靠谱座位...")
-            continue_url = str(self._select_workspace(workspace_id) or "").strip()
+            selected_workspace_id, continue_url = self._select_workspace_for_current_session(
+                preferred_workspace_id=workspace_id,
+                referer_url=otp_continue or cached_continue or None,
+            )
+            if selected_workspace_id:
+                workspace_id = selected_workspace_id
+                result.workspace_id = selected_workspace_id
+            continue_url = str(continue_url or "").strip()
             if not continue_url:
                 self._log("workspace/select 未返回 continue_url，尝试 OAuth authorize 兜底", "warning")
 
@@ -2488,7 +2510,13 @@ class RegistrationEngine:
         if workspace_id:
             result.workspace_id = workspace_id
             self._log("选择 Workspace，安排个靠谱座位...")
-            continue_url = str(self._select_workspace(workspace_id) or "").strip()
+            selected_workspace_id, continue_url = self._select_workspace_for_current_session(
+                preferred_workspace_id=workspace_id,
+            )
+            if selected_workspace_id:
+                workspace_id = selected_workspace_id
+                result.workspace_id = selected_workspace_id
+            continue_url = str(continue_url or "").strip()
             if not continue_url:
                 self._log("workspace/select 未返回 continue_url，尝试使用缓存 continue_url", "warning")
         else:
@@ -2623,7 +2651,13 @@ class RegistrationEngine:
 
             continue_url = ""
             if workspace_id:
-                continue_url = str(self._select_workspace(workspace_id) or "").strip()
+                selected_workspace_id, continue_url = self._select_workspace_for_current_session(
+                    preferred_workspace_id=workspace_id,
+                )
+                if selected_workspace_id:
+                    workspace_id = selected_workspace_id
+                    result.workspace_id = selected_workspace_id
+                continue_url = str(continue_url or "").strip()
             if not continue_url:
                 cached_continue = str(self._create_account_continue_url or "").strip()
                 if cached_continue:
@@ -3314,137 +3348,238 @@ class RegistrationEngine:
             self._log(f"创建账户失败: {e}", "error")
             return False
 
+    @staticmethod
+    def _append_unique_workspace_candidate(
+        candidates: List[str],
+        seen: set[str],
+        value: Any,
+    ) -> None:
+        candidate = str(value or "").strip()
+        if not candidate or candidate in seen:
+            return
+        candidates.append(candidate)
+        seen.add(candidate)
+
+    def _iter_workspace_candidates_from_payload(self, payload: Any):
+        if not isinstance(payload, dict):
+            return
+
+        for key in ("workspace_id", "workspaceId", "default_workspace_id", "defaultWorkspaceId"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                yield value
+
+        workspace_payload = payload.get("workspace")
+        if isinstance(workspace_payload, dict):
+            workspace_id = str(workspace_payload.get("id") or "").strip()
+            if workspace_id:
+                yield workspace_id
+
+        for key in ("account_id", "accountId", "chatgpt_account_id", "organization_id", "default_organization_id"):
+            value = str(payload.get(key) or "").strip()
+            if value:
+                yield value
+
+        organizations = payload.get("organizations") or []
+        if isinstance(organizations, list):
+            for item in organizations:
+                if not isinstance(item, dict):
+                    continue
+                organization_id = str(item.get("id") or "").strip()
+                if organization_id:
+                    yield organization_id
+
+        workspaces = payload.get("workspaces") or []
+        if isinstance(workspaces, list):
+            for item in workspaces:
+                if not isinstance(item, dict):
+                    continue
+                workspace_id = str(item.get("id") or "").strip()
+                if workspace_id:
+                    yield workspace_id
+
+        account_payload = payload.get("account")
+        if isinstance(account_payload, dict):
+            account_id = str(account_payload.get("id") or "").strip()
+            if account_id:
+                yield account_id
+            yield from self._iter_workspace_candidates_from_payload(account_payload)
+
+        auth_payload = payload.get("https://api.openai.com/auth")
+        if isinstance(auth_payload, dict):
+            yield from self._iter_workspace_candidates_from_payload(auth_payload)
+
+    def _iter_auth_cookie_payloads(self):
+        if not self.session:
+            return
+
+        auth_cookie = str(self.session.cookies.get("oai-client-auth-session") or "").strip()
+        if auth_cookie:
+            candidate_payloads: List[str] = []
+            segments = auth_cookie.split(".")
+            if len(segments) >= 2 and segments[1]:
+                candidate_payloads.append(segments[1])
+            if segments and segments[0]:
+                candidate_payloads.append(segments[0])
+            candidate_payloads.append(auth_cookie)
+
+            for payload in candidate_payloads:
+                raw = str(payload or "").strip()
+                if not raw:
+                    continue
+                auth_json = None
+                try:
+                    pad = "=" * ((4 - (len(raw) % 4)) % 4)
+                    decoded = base64.urlsafe_b64decode((raw + pad).encode("ascii"))
+                    auth_json = json.loads(decoded.decode("utf-8"))
+                except Exception:
+                    try:
+                        auth_json = json.loads(raw)
+                    except Exception:
+                        auth_json = None
+                if isinstance(auth_json, dict):
+                    yield auth_json
+        else:
+            self._log("未能获取到授权 Cookie，尝试从 auth-info 里取 workspace", "warning")
+
+        auth_info_raw = str(self.session.cookies.get("oai-client-auth-info") or "").strip()
+        if auth_info_raw:
+            import urllib.parse as urlparse
+
+            auth_info_text = auth_info_raw
+            for _ in range(2):
+                decoded = urlparse.unquote(auth_info_text)
+                if decoded == auth_info_text:
+                    break
+                auth_info_text = decoded
+            try:
+                auth_info_json = json.loads(auth_info_text)
+            except Exception as auth_info_err:
+                self._log(f"解析 auth-info Cookie 失败: {auth_info_err}", "warning")
+            else:
+                if isinstance(auth_info_json, dict):
+                    yield auth_info_json
+
+    def _extract_workspace_candidates_from_text(self, text: str) -> List[str]:
+        matches: List[str] = []
+        for pattern in CONSENT_WORKSPACE_PATTERNS + CONSENT_ACCOUNT_PATTERNS:
+            for match in re.finditer(pattern, text or "", re.IGNORECASE):
+                candidate = str(match.group(1) or "").strip()
+                if candidate:
+                    matches.append(candidate)
+        return matches
+
+    def _resolve_workspace_selection_referer(self, referer_url: Optional[str] = None) -> str:
+        return str(
+            referer_url
+            or self._last_validate_otp_continue_url
+            or self._create_account_continue_url
+            or "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+        ).strip()
+
+    def _fetch_workspace_selection_context(
+        self,
+        referer_url: Optional[str] = None,
+    ) -> Tuple[str, str, Dict[str, Any]]:
+        raw_referer = str(
+            referer_url
+            or self._last_validate_otp_continue_url
+            or self._create_account_continue_url
+            or ""
+        ).strip()
+        consent_page_url = raw_referer or self._resolve_workspace_selection_referer(referer_url)
+        consent_text = ""
+        if self.session and raw_referer and consent_page_url.startswith("https://auth.openai.com/"):
+            lowered = consent_page_url.lower()
+            if "localhost:1455" not in lowered and "about-you" not in lowered and "add-phone" not in lowered:
+                try:
+                    response = self.session.get(
+                        consent_page_url,
+                        allow_redirects=True,
+                        timeout=20,
+                    )
+                    response_url = str(getattr(response, "url", consent_page_url) or consent_page_url).strip()
+                    if response_url:
+                        consent_page_url = response_url
+                    consent_text = str(getattr(response, "text", "") or "")
+                except Exception as exc:
+                    self._log(f"获取 workspace consent 页面失败: {exc}", "warning")
+
+        session_payload = self._fetch_auth_session_payload()
+        return consent_page_url, consent_text, session_payload
+
+    def _get_workspace_candidates(
+        self,
+        *,
+        preferred_workspace_id: str = "",
+        session_payload: Optional[Dict[str, Any]] = None,
+        consent_text: str = "",
+    ) -> List[str]:
+        candidates: List[str] = []
+        seen: set[str] = set()
+
+        self._append_unique_workspace_candidate(candidates, seen, preferred_workspace_id)
+        self._append_unique_workspace_candidate(candidates, seen, self._last_validate_otp_workspace_id)
+        self._append_unique_workspace_candidate(candidates, seen, self._create_account_workspace_id)
+        self._append_unique_workspace_candidate(candidates, seen, self._create_account_account_id)
+
+        for auth_payload in self._iter_auth_cookie_payloads():
+            for value in self._iter_workspace_candidates_from_payload(auth_payload):
+                self._append_unique_workspace_candidate(candidates, seen, value)
+
+        payload = session_payload if isinstance(session_payload, dict) else self._fetch_auth_session_payload()
+        for value in self._iter_workspace_candidates_from_payload(payload):
+            self._append_unique_workspace_candidate(candidates, seen, value)
+
+        for value in self._extract_workspace_candidates_from_text(consent_text):
+            self._append_unique_workspace_candidate(candidates, seen, value)
+
+        return candidates
+
     def _get_workspace_id(self) -> Optional[str]:
         """获取 Workspace ID"""
         try:
-            def _extract_workspace_id(payload: Any) -> str:
-                if not isinstance(payload, dict):
-                    return ""
-                workspace_id = str(
-                    payload.get("workspace_id")
-                    or payload.get("workspaceId")
-                    or payload.get("default_workspace_id")
-                    or payload.get("defaultWorkspaceId")
-                    or ((payload.get("workspace") or {}).get("id") if isinstance(payload.get("workspace"), dict) else "")
-                    or ""
-                ).strip()
+            candidates = self._get_workspace_candidates()
+            if candidates:
+                workspace_id = str(candidates[0] or "").strip()
                 if workspace_id:
+                    self._log(f"Workspace ID: {workspace_id}")
                     return workspace_id
-                organizations = payload.get("organizations") or []
-                if isinstance(organizations, list):
-                    for item in organizations:
-                        if not isinstance(item, dict):
-                            continue
-                        organization_id = str(item.get("id") or "").strip()
-                        if organization_id:
-                            return organization_id
-                workspaces = payload.get("workspaces") or []
-                if isinstance(workspaces, list) and workspaces:
-                    return str((workspaces[0] or {}).get("id") or "").strip()
-                account_payload = payload.get("account")
-                if isinstance(account_payload, dict):
-                    nested_workspace_id = _extract_workspace_id(account_payload)
-                    if nested_workspace_id:
-                        return nested_workspace_id
-                auth_payload = payload.get("https://api.openai.com/auth")
-                if isinstance(auth_payload, dict):
-                    nested_workspace_id = _extract_workspace_id(auth_payload)
-                    if nested_workspace_id:
-                        return nested_workspace_id
-                return ""
-
-            auth_cookie = str(self.session.cookies.get("oai-client-auth-session") or "").strip()
-            if not auth_cookie:
-                self._log("未能获取到授权 Cookie，尝试从 auth-info 里取 workspace", "warning")
-
-            # 解码 JWT
-            import base64
-            import json as json_module
-            import urllib.parse as urlparse
-
-            try:
-                candidate_payloads: List[str] = []
-                if auth_cookie:
-                    segments = auth_cookie.split(".")
-                    # 对齐 ABCard：优先 JWT payload 段（第 2 段）
-                    if len(segments) >= 2 and segments[1]:
-                        candidate_payloads.append(segments[1])
-                    if segments and segments[0]:
-                        candidate_payloads.append(segments[0])
-                    # 极端情况下 cookie 可能直接是 JSON 字符串
-                    candidate_payloads.append(auth_cookie)
-
-                for payload in candidate_payloads:
-                    raw = str(payload or "").strip()
-                    if not raw:
-                        continue
-                    auth_json = None
-                    try:
-                        pad = "=" * ((4 - (len(raw) % 4)) % 4)
-                        decoded = base64.urlsafe_b64decode((raw + pad).encode("ascii"))
-                        auth_json = json_module.loads(decoded.decode("utf-8"))
-                    except Exception:
-                        try:
-                            auth_json = json_module.loads(raw)
-                        except Exception:
-                            auth_json = None
-
-                    workspace_id = _extract_workspace_id(auth_json)
-                    if workspace_id:
-                        self._log(f"Workspace ID: {workspace_id}")
-                        return workspace_id
-
-                # 兜底：从 oai-client-auth-info（URL 编码 JSON）提取 workspace
-                auth_info_raw = str(self.session.cookies.get("oai-client-auth-info") or "").strip()
-                if auth_info_raw:
-                    auth_info_text = auth_info_raw
-                    for _ in range(2):
-                        decoded = urlparse.unquote(auth_info_text)
-                        if decoded == auth_info_text:
-                            break
-                        auth_info_text = decoded
-                    try:
-                        auth_info_json = json_module.loads(auth_info_text)
-                        workspace_id = _extract_workspace_id(auth_info_json)
-                        if workspace_id:
-                            self._log(f"Workspace ID (auth-info): {workspace_id}")
-                            return workspace_id
-                    except Exception as auth_info_err:
-                        self._log(f"解析 auth-info Cookie 失败: {auth_info_err}", "warning")
-
-                session_payload = self._fetch_auth_session_payload()
-                if session_payload:
-                    workspace_id = _extract_workspace_id(session_payload)
-                    if workspace_id:
-                        self._log(f"Workspace ID (auth/session): {workspace_id}")
-                        return workspace_id
-
-                # 兜底：复用 create_account 缓存
-                cached_workspace = str(self._create_account_workspace_id or "").strip()
-                if cached_workspace:
-                    self._log(f"Workspace ID (create_account缓存): {cached_workspace}")
-                    return cached_workspace
-
-                self._log("授权 Cookie 里没有 workspace 信息", "warning")
-                return None
-
-            except Exception as e:
-                self._log(f"解析授权 Cookie 失败: {e}", "warning")
-                return None
-
+            self._log("授权 Cookie 里没有 workspace 信息", "warning")
+            return None
         except Exception as e:
             self._log(f"获取 Workspace ID 失败: {e}", "error")
             return None
 
-    def _select_workspace(self, workspace_id: str) -> Optional[str]:
+    def _select_workspace_for_current_session(
+        self,
+        *,
+        preferred_workspace_id: str = "",
+        referer_url: Optional[str] = None,
+    ) -> Tuple[str, Optional[str]]:
+        consent_page_url, consent_text, session_payload = self._fetch_workspace_selection_context(referer_url)
+        candidates = self._get_workspace_candidates(
+            preferred_workspace_id=preferred_workspace_id,
+            session_payload=session_payload,
+            consent_text=consent_text,
+        )
+        if not candidates:
+            self._log("未获取到 Workspace 候选", "warning")
+            return "", None
+
+        for candidate in candidates:
+            continue_url = self._select_workspace(candidate, referer_url=consent_page_url)
+            if continue_url:
+                return candidate, continue_url
+
+        self._log(f"workspace/select 未成功；候选: {', '.join(candidates[:5])}", "warning")
+        return "", None
+
+    def _select_workspace(self, workspace_id: str, *, referer_url: Optional[str] = None) -> Optional[str]:
         """选择 Workspace"""
         try:
             select_body = f'{{"workspace_id":"{workspace_id}"}}'
-            referer = str(
-                self._last_validate_otp_continue_url
-                or self._create_account_continue_url
-                or "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
-            ).strip()
+            referer = self._resolve_workspace_selection_referer(referer_url)
 
             response = self.session.post(
                 OPENAI_API_ENDPOINTS["select_workspace"],

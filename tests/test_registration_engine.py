@@ -246,6 +246,23 @@ def test_get_workspace_id_falls_back_to_auth_session_payload():
     assert workspace_id == "org-auth-session"
 
 
+def test_get_workspace_id_falls_back_to_auth_session_account_id():
+    session = QueueSession([
+        (
+            "GET",
+            "https://chatgpt.com/api/auth/session",
+            DummyResponse(payload={"account": {"id": "acct-auth-session"}}),
+        ),
+    ])
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.session = session
+
+    workspace_id = engine._get_workspace_id()
+
+    assert workspace_id == "acct-auth-session"
+
+
 def test_select_workspace_uses_last_continue_url_as_referer():
     session = QueueSession([
         (
@@ -263,6 +280,46 @@ def test_select_workspace_uses_last_continue_url_as_referer():
 
     assert continue_url == "https://auth.example.test/continue"
     assert session.calls[0]["kwargs"]["headers"]["referer"] == "https://auth.openai.com/add-phone"
+
+
+def test_select_workspace_for_current_session_tries_fallback_candidates():
+    session = QueueSession([
+        (
+            "GET",
+            "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            DummyResponse(
+                text='{"account_id":"acct-fallback"}',
+            ),
+        ),
+        (
+            "GET",
+            "https://chatgpt.com/api/auth/session",
+            DummyResponse(payload={"account": {"workspace_id": "org-primary", "id": "acct-fallback"}}),
+        ),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["select_workspace"],
+            DummyResponse(status_code=400, text="workspace not allowed"),
+        ),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["select_workspace"],
+            DummyResponse(payload={"continue_url": "https://auth.example.test/continue-fallback"}),
+        ),
+    ])
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.session = session
+    engine._last_validate_otp_continue_url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+
+    workspace_id, continue_url = engine._select_workspace_for_current_session(
+        preferred_workspace_id="org-primary",
+    )
+
+    assert workspace_id == "acct-fallback"
+    assert continue_url == "https://auth.example.test/continue-fallback"
+    assert json.loads(session.calls[2]["kwargs"]["data"]) == {"workspace_id": "org-primary"}
+    assert json.loads(session.calls[3]["kwargs"]["data"]) == {"workspace_id": "acct-fallback"}
 
 
 def test_extract_session_token_from_cookie_text_supports_authjs_name():
@@ -325,6 +382,16 @@ def test_run_registers_then_relogs_to_fetch_token():
             DummyResponse(payload={"page": {"type": OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]}}),
         ),
         ("POST", OPENAI_API_ENDPOINTS["validate_otp"], _response_with_login_cookies()),
+        (
+            "GET",
+            "https://chatgpt.com/api/auth/session",
+            DummyResponse(payload={"account": {"workspace_id": "ws-1"}}),
+        ),
+        (
+            "GET",
+            "https://chatgpt.com/api/auth/session",
+            DummyResponse(payload={"account": {"workspace_id": "ws-1"}}),
+        ),
         (
             "POST",
             OPENAI_API_ENDPOINTS["select_workspace"],
@@ -395,6 +462,16 @@ def test_existing_account_login_uses_auto_sent_otp_without_manual_send():
             DummyResponse(payload={"page": {"type": OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]}}),
         ),
         ("POST", OPENAI_API_ENDPOINTS["validate_otp"], _response_with_login_cookies("ws-existing", "session-existing")),
+        (
+            "GET",
+            "https://chatgpt.com/api/auth/session",
+            DummyResponse(payload={"account": {"workspace_id": "ws-existing"}}),
+        ),
+        (
+            "GET",
+            "https://chatgpt.com/api/auth/session",
+            DummyResponse(payload={"account": {"workspace_id": "ws-existing"}}),
+        ),
         (
             "POST",
             OPENAI_API_ENDPOINTS["select_workspace"],
