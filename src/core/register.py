@@ -2347,18 +2347,21 @@ class RegistrationEngine:
             self._log("create_account 缓存 continue_url 指向注册门页（about-you/add-phone），本轮收尾忽略该地址")
             cached_continue = ""
 
-        if workspace_id:
-            self._log("选择 Workspace，安排个靠谱座位...")
-            selected_workspace_id, continue_url = self._select_workspace_for_current_session(
-                preferred_workspace_id=workspace_id,
-                referer_url=otp_continue or cached_continue or None,
-            )
-            if selected_workspace_id:
-                workspace_id = selected_workspace_id
-                result.workspace_id = selected_workspace_id
-            continue_url = str(continue_url or "").strip()
-            if not continue_url:
-                self._log("workspace/select 未返回 continue_url，尝试 OAuth authorize 兜底", "warning")
+        self._log("选择 Workspace，安排个靠谱座位...")
+        if not workspace_id:
+            self._log("当前未直接拿到 Workspace ID，改去 consent 页面摸候选...")
+        selected_workspace_id, continue_url = self._select_workspace_for_current_session(
+            preferred_workspace_id=workspace_id,
+            referer_url=otp_continue or cached_continue or None,
+        )
+        if selected_workspace_id:
+            workspace_id = selected_workspace_id
+            result.workspace_id = selected_workspace_id
+        continue_url = str(continue_url or "").strip()
+        if workspace_id and not continue_url:
+            self._log("workspace/select 未返回 continue_url，尝试 OAuth authorize 兜底", "warning")
+        if (not workspace_id) and (not continue_url):
+            self._log("consent/workspace/select 未拿到可用结果，尝试 OAuth authorize 兜底", "warning")
 
         if not continue_url:
             oauth_start_url = str(
@@ -3480,7 +3483,13 @@ class RegistrationEngine:
     def _fetch_workspace_selection_context(
         self,
         referer_url: Optional[str] = None,
+        *,
+        force_probe: bool = False,
     ) -> Tuple[str, str, Dict[str, Any]]:
+        def _is_registration_gate_url(url: str) -> bool:
+            lowered = str(url or "").strip().lower()
+            return bool(lowered) and ("about-you" in lowered or "add-phone" in lowered)
+
         raw_referer = str(
             referer_url
             or self._last_validate_otp_continue_url
@@ -3488,18 +3497,23 @@ class RegistrationEngine:
             or ""
         ).strip()
         consent_page_url = raw_referer or self._resolve_workspace_selection_referer(referer_url)
+        should_probe_default_consent = force_probe or _is_registration_gate_url(consent_page_url)
+        if (not consent_page_url) or should_probe_default_consent:
+            consent_page_url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
         consent_text = ""
-        if self.session and raw_referer and consent_page_url.startswith("https://auth.openai.com/"):
+        should_fetch_consent = bool(raw_referer) or should_probe_default_consent
+        if self.session and should_fetch_consent and consent_page_url.startswith("https://auth.openai.com/"):
             lowered = consent_page_url.lower()
             if "localhost:1455" not in lowered and "about-you" not in lowered and "add-phone" not in lowered:
                 try:
+                    request_url = consent_page_url
                     response = self.session.get(
-                        consent_page_url,
+                        request_url,
                         allow_redirects=True,
                         timeout=20,
                     )
-                    response_url = str(getattr(response, "url", consent_page_url) or consent_page_url).strip()
-                    if response_url:
+                    response_url = str(getattr(response, "url", request_url) or request_url).strip()
+                    if response_url and ("localhost:1455" not in response_url.lower()) and (not _is_registration_gate_url(response_url)):
                         consent_page_url = response_url
                     consent_text = str(getattr(response, "text", "") or "")
                 except Exception as exc:
@@ -3557,7 +3571,10 @@ class RegistrationEngine:
         preferred_workspace_id: str = "",
         referer_url: Optional[str] = None,
     ) -> Tuple[str, Optional[str]]:
-        consent_page_url, consent_text, session_payload = self._fetch_workspace_selection_context(referer_url)
+        consent_page_url, consent_text, session_payload = self._fetch_workspace_selection_context(
+            referer_url,
+            force_probe=not bool(str(preferred_workspace_id or "").strip()),
+        )
         candidates = self._get_workspace_candidates(
             preferred_workspace_id=preferred_workspace_id,
             session_payload=session_payload,

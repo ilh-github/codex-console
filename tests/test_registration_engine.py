@@ -4,7 +4,7 @@ import json
 from src.config.constants import EmailServiceType, OPENAI_API_ENDPOINTS, OPENAI_PAGE_TYPES, generate_random_user_info
 from src.core.http_client import OpenAIHTTPClient
 from src.core.openai.oauth import OAuthStart
-from src.core.register import RegistrationEngine
+from src.core.register import RegistrationEngine, RegistrationResult
 from src.services.base import BaseEmailService
 
 
@@ -322,6 +322,41 @@ def test_select_workspace_for_current_session_tries_fallback_candidates():
     assert json.loads(session.calls[3]["kwargs"]["data"]) == {"workspace_id": "acct-fallback"}
 
 
+def test_select_workspace_for_current_session_probes_default_consent_when_gate_continue_url():
+    session = QueueSession([
+        (
+            "GET",
+            "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            DummyResponse(
+                text='{"account_id":"acct-consent"}',
+            ),
+        ),
+        (
+            "GET",
+            "https://chatgpt.com/api/auth/session",
+            DummyResponse(payload={}),
+        ),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["select_workspace"],
+            DummyResponse(payload={"continue_url": "https://auth.example.test/continue-consent"}),
+        ),
+    ])
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.session = session
+    engine._last_validate_otp_continue_url = "https://auth.openai.com/add-phone"
+    engine._create_account_continue_url = "https://auth.openai.com/add-phone"
+
+    workspace_id, continue_url = engine._select_workspace_for_current_session()
+
+    assert workspace_id == "acct-consent"
+    assert continue_url == "https://auth.example.test/continue-consent"
+    assert session.calls[0]["url"] == "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+    assert session.calls[2]["kwargs"]["headers"]["referer"] == "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+    assert json.loads(session.calls[2]["kwargs"]["data"]) == {"workspace_id": "acct-consent"}
+
+
 def test_extract_session_token_from_cookie_text_supports_authjs_name():
     token = RegistrationEngine._extract_session_token_from_cookie_text(
         "foo=bar; __Secure-authjs.session-token=authjs-token-value; path=/"
@@ -354,6 +389,64 @@ def test_visit_continue_url_for_session_keeps_chatgpt_callback():
 
     assert final_url == callback_url
     assert session.calls[0]["url"] == callback_url
+
+
+def test_native_backup_uses_consent_probe_when_workspace_id_missing(monkeypatch):
+    session = QueueSession([
+        (
+            "GET",
+            "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            DummyResponse(text='{"account_id":"acct-consent"}'),
+        ),
+        (
+            "GET",
+            "https://chatgpt.com/api/auth/session",
+            DummyResponse(payload={}),
+        ),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["select_workspace"],
+            DummyResponse(payload={"continue_url": "https://auth.example.test/continue-consent"}),
+        ),
+    ])
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.session = session
+    engine.password = "pw-1"
+    engine.device_id = "did-1"
+    callback_url = "http://localhost:1455/auth/callback?code=code-2&state=state-2"
+
+    def fake_verify_email_otp_with_retry(*args, **kwargs):
+        engine._last_validate_otp_continue_url = "https://auth.openai.com/add-phone"
+        engine._last_validate_otp_workspace_id = ""
+        return True
+
+    monkeypatch.setattr(engine, "_verify_email_otp_with_retry", fake_verify_email_otp_with_retry)
+    monkeypatch.setattr(engine, "_send_verification_code", lambda referer=None: True)
+    monkeypatch.setattr(engine, "_retrigger_login_otp", lambda: True)
+    monkeypatch.setattr(engine, "_visit_continue_url_for_session", lambda continue_url, result=None: continue_url)
+    monkeypatch.setattr(engine, "_get_workspace_id", lambda: "")
+    monkeypatch.setattr(engine, "_follow_redirects", lambda start_url: (callback_url, callback_url))
+    monkeypatch.setattr(
+        engine,
+        "_handle_oauth_callback",
+        lambda callback: {
+            "account_id": "acct-2",
+            "access_token": "access-2",
+            "refresh_token": "refresh-2",
+            "id_token": "id-2",
+        },
+    )
+
+    result = RegistrationResult(success=False, logs=engine.logs)
+    ok = engine._complete_token_exchange_native_backup(result)
+
+    assert ok is True
+    assert result.workspace_id == "acct-consent"
+    assert result.account_id == "acct-2"
+    assert result.access_token == "access-2"
+    assert session.calls[0]["url"] == "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+    assert session.calls[2]["kwargs"]["headers"]["referer"] == "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
 
 
 def test_run_registers_then_relogs_to_fetch_token():
