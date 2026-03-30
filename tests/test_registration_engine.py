@@ -1,5 +1,6 @@
 import base64
 import json
+import urllib.parse
 
 from src.config.constants import EmailServiceType, OPENAI_API_ENDPOINTS, OPENAI_PAGE_TYPES, generate_random_user_info
 from src.core.http_client import OpenAIHTTPClient
@@ -263,6 +264,23 @@ def test_get_workspace_id_falls_back_to_auth_session_account_id():
     assert workspace_id == "acct-auth-session"
 
 
+def test_get_workspace_id_parses_base64_auth_info_cookie(monkeypatch):
+    auth_info_payload = base64.urlsafe_b64encode(
+        json.dumps({"workspaces": [{"id": "ws-auth-info"}]}).encode("utf-8")
+    ).decode("ascii").rstrip("=")
+    session = QueueSession([])
+    session.cookies["oai-client-auth-info"] = urllib.parse.quote(auth_info_payload)
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.session = session
+
+    monkeypatch.setattr(engine, "_fetch_auth_session_payload", lambda: {})
+
+    workspace_id = engine._get_workspace_id()
+
+    assert workspace_id == "ws-auth-info"
+
+
 def test_select_workspace_uses_last_continue_url_as_referer():
     session = QueueSession([
         (
@@ -357,6 +375,49 @@ def test_select_workspace_for_current_session_probes_default_consent_when_gate_c
     assert json.loads(session.calls[2]["kwargs"]["data"]) == {"workspace_id": "acct-consent"}
 
 
+def test_select_workspace_for_current_session_retries_until_candidates_appear(monkeypatch):
+    session = QueueSession([
+        (
+            "GET",
+            "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            DummyResponse(text="<html>consent-1</html>"),
+        ),
+        (
+            "GET",
+            "https://chatgpt.com/api/auth/session",
+            DummyResponse(payload={}),
+        ),
+        (
+            "GET",
+            "https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+            DummyResponse(text='{"account_id":"acct-retry"}'),
+        ),
+        (
+            "GET",
+            "https://chatgpt.com/api/auth/session",
+            DummyResponse(payload={}),
+        ),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["select_workspace"],
+            DummyResponse(payload={"continue_url": "https://auth.example.test/continue-retry"}),
+        ),
+    ])
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.session = session
+
+    monkeypatch.setattr("src.core.register.time.sleep", lambda seconds: None)
+
+    workspace_id, continue_url = engine._select_workspace_for_current_session(
+        referer_url="https://auth.openai.com/sign-in-with-chatgpt/codex/consent",
+    )
+
+    assert workspace_id == "acct-retry"
+    assert continue_url == "https://auth.example.test/continue-retry"
+    assert json.loads(session.calls[4]["kwargs"]["data"]) == {"workspace_id": "acct-retry"}
+
+
 def test_extract_session_token_from_cookie_text_supports_authjs_name():
     token = RegistrationEngine._extract_session_token_from_cookie_text(
         "foo=bar; __Secure-authjs.session-token=authjs-token-value; path=/"
@@ -447,6 +508,359 @@ def test_native_backup_uses_consent_probe_when_workspace_id_missing(monkeypatch)
     assert result.access_token == "access-2"
     assert session.calls[0]["url"] == "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
     assert session.calls[2]["kwargs"]["headers"]["referer"] == "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
+
+
+def test_native_backup_does_not_resend_login_otp_after_failure(monkeypatch):
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+
+    monkeypatch.setattr(engine, "_verify_email_otp_with_retry", lambda *args, **kwargs: False)
+    monkeypatch.setattr(
+        engine,
+        "_send_verification_code",
+        lambda referer=None: (_ for _ in ()).throw(AssertionError("unexpected resend")),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_retrigger_login_otp",
+        lambda: (_ for _ in ()).throw(AssertionError("unexpected retrigger")),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_restart_login_flow",
+        lambda: (_ for _ in ()).throw(AssertionError("unexpected relogin")),
+    )
+
+    result = RegistrationResult(success=False, logs=engine.logs)
+
+    ok = engine._complete_token_exchange_native_backup(result)
+
+    assert ok is False
+    assert result.error_message == "验证码校验失败"
+
+
+def test_resume_oauth_context_from_authorize_can_continue_from_consent(monkeypatch):
+    session = QueueSession([
+        (
+            "GET",
+            "https://auth.example.test/authorize",
+            DummyResponse(text='<html>consent_challenge=abc123</html>'),
+        ),
+        (
+            "GET",
+            "https://auth.openai.com/api/accounts/consent?consent_challenge=abc123",
+            DummyResponse(text='{"account_id":"acct-resume"}'),
+        ),
+        (
+            "GET",
+            "https://chatgpt.com/api/auth/session",
+            DummyResponse(payload={}),
+        ),
+        (
+            "POST",
+            OPENAI_API_ENDPOINTS["select_workspace"],
+            DummyResponse(payload={"continue_url": "https://auth.example.test/continue-resume"}),
+        ),
+    ])
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.session = session
+    engine.password = "pw-1"
+    engine.device_id = "did-1"
+    engine.oauth_start = OAuthStart(
+        auth_url="https://auth.example.test/authorize",
+        state="state-1",
+        code_verifier="verifier-1",
+        redirect_uri="http://localhost:1455/auth/callback",
+    )
+
+    callback_url = "http://localhost:1455/auth/callback?code=code-1&state=state-1"
+    monkeypatch.setattr(engine, "_follow_redirects", lambda start_url, referer=None: (callback_url, callback_url))
+    monkeypatch.setattr(
+        engine,
+        "_handle_oauth_callback",
+        lambda callback: {
+            "account_id": "acct-token",
+            "access_token": "access-token",
+            "refresh_token": "refresh-token",
+            "id_token": "id-token",
+        },
+    )
+
+    result = RegistrationResult(success=False, logs=engine.logs)
+    ok = engine._resume_oauth_context_from_authorize(
+        result,
+        label="当前登录后的已认证会话",
+    )
+
+    assert ok is True
+    assert result.workspace_id == "acct-resume"
+    assert result.account_id == "acct-token"
+    assert result.access_token == "access-token"
+    assert session.calls[1]["url"] == "https://auth.openai.com/api/accounts/consent?consent_challenge=abc123"
+
+
+def test_bootstrap_chatgpt_then_resume_codex_prefers_chatgpt_web_session(monkeypatch):
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+
+    chatgpt_calls = []
+    monkeypatch.setattr(
+        engine,
+        "_bootstrap_chatgpt_web_session_direct",
+        lambda result, allow_partial_success=False: (
+            chatgpt_calls.append("direct"),
+            setattr(result, "workspace_id", "ws-chatgpt"),
+            True,
+        )[2],
+    )
+    monkeypatch.setattr(
+        engine,
+        "_bootstrap_session_token_via_chatgpt_full_login",
+        lambda result: (_ for _ in ()).throw(AssertionError("unexpected full login fallback")),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_resume_oauth_context_from_authorize",
+        lambda result, label: (chatgpt_calls.append(f"resume:{label}"), True)[1],
+    )
+
+    result = RegistrationResult(success=False, logs=engine.logs)
+    ok = engine._bootstrap_chatgpt_then_resume_codex(
+        result,
+        label="当前登录后的已认证会话",
+    )
+
+    assert ok is True
+    assert result.workspace_id == "ws-chatgpt"
+    assert chatgpt_calls == [
+        "direct",
+        "resume:当前登录后的已认证会话（ChatGPT 预热后）",
+    ]
+
+
+def test_bootstrap_chatgpt_then_resume_codex_falls_back_to_full_login(monkeypatch):
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+
+    chatgpt_calls = []
+    monkeypatch.setattr(
+        engine,
+        "_bootstrap_chatgpt_web_session_direct",
+        lambda result, allow_partial_success=False: (chatgpt_calls.append("direct"), False)[1],
+    )
+    monkeypatch.setattr(
+        engine,
+        "_bootstrap_session_token_via_chatgpt_full_login",
+        lambda result: (chatgpt_calls.append("full"), setattr(result, "workspace_id", "ws-full"), True)[2],
+    )
+    monkeypatch.setattr(
+        engine,
+        "_resume_oauth_context_from_authorize",
+        lambda result, label: (chatgpt_calls.append(f"resume:{label}"), True)[1],
+    )
+
+    result = RegistrationResult(success=False, logs=engine.logs)
+    ok = engine._bootstrap_chatgpt_then_resume_codex(
+        result,
+        label="当前登录后的已认证会话",
+    )
+
+    assert ok is True
+    assert result.workspace_id == "ws-full"
+    assert chatgpt_calls == [
+        "direct",
+        "full",
+        "resume:当前登录后的已认证会话（ChatGPT 预热后）",
+    ]
+
+
+def test_follow_redirects_can_continue_from_consent_challenge_html():
+    start_url = "https://auth.example.test/continue"
+    consent_url = "https://auth.openai.com/api/accounts/consent?consent_challenge=consent-1"
+    callback_url = "http://localhost:1455/auth/callback?code=code-1&state=state-1"
+    session = QueueSession([
+        (
+            "GET",
+            start_url,
+            DummyResponse(status_code=200, text='<html>consent_challenge=consent-1</html>'),
+        ),
+        (
+            "GET",
+            consent_url,
+            DummyResponse(status_code=302, headers={"Location": callback_url}),
+        ),
+        (
+            "GET",
+            "https://chatgpt.com/",
+            DummyResponse(status_code=200),
+        ),
+    ])
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.session = session
+
+    resolved_callback, final_url = engine._follow_redirects(start_url)
+
+    assert resolved_callback == callback_url
+    assert final_url == callback_url
+
+
+def test_follow_chatgpt_auth_redirects_can_continue_from_callback_html():
+    start_url = "https://auth.openai.com/api/accounts/authorize?client_id=app_X8zY6vW2pQ9tR3dE7nK1jL5gH"
+    callback_url = "https://chatgpt.com/api/auth/callback/openai?code=cb-1&state=st-1"
+    session = QueueSession([
+        (
+            "GET",
+            start_url,
+            DummyResponse(status_code=200, text=f'<html><a href="{callback_url}">continue</a></html>'),
+        ),
+        (
+            "GET",
+            callback_url,
+            DummyResponse(status_code=302, headers={"Location": "https://chatgpt.com/"}),
+        ),
+        (
+            "GET",
+            "https://chatgpt.com/",
+            DummyResponse(status_code=200),
+        ),
+    ])
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.session = session
+
+    resolved_callback, final_url = engine._follow_chatgpt_auth_redirects(start_url)
+
+    assert resolved_callback == callback_url
+    assert final_url == "https://chatgpt.com/"
+
+
+def test_bootstrap_chatgpt_web_session_direct_resumes_auth_chain_before_direct_login(monkeypatch):
+    class TempSession:
+        def __init__(self):
+            self.cookies = {}
+            self.calls = []
+
+        def get(self, url, **kwargs):
+            self.calls.append(("GET", url, kwargs))
+            return DummyResponse(status_code=200)
+
+    temp_session = TempSession()
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.email = "tester@example.com"
+    engine.password = "pw-1"
+
+    def fake_temp_session(*args, **kwargs):
+        return temp_session
+
+    bridge_calls = []
+    wait_results = iter([
+        ({}, ""),
+        (
+            {
+                "accessToken": "access-bridge",
+                "user": {"id": "user-bridge"},
+                "account": {"id": "acct-bridge", "workspace_id": "ws-bridge"},
+            },
+            "session-bridge",
+        ),
+    ])
+
+    monkeypatch.setattr("src.core.register.cffi_requests.Session", fake_temp_session)
+    monkeypatch.setattr(
+        engine,
+        "_run_chatgpt_nextauth_bridge",
+        lambda session_obj, *, email, device_id, log_prefix: (
+            "https://auth.openai.com/api/accounts/authorize?client_id=app_X8zY6vW2pQ9tR3dE7nK1jL5gH",
+            "https://auth.openai.com/api/accounts/authorize?client_id=app_X8zY6vW2pQ9tR3dE7nK1jL5gH",
+        ),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_wait_for_chatgpt_web_session",
+        lambda session_obj, timeout=12: next(wait_results),
+    )
+
+    def fake_follow(start_url):
+        bridge_calls.append(start_url)
+        return (
+            "https://chatgpt.com/api/auth/callback/openai?code=cb-2&state=st-2",
+            "https://chatgpt.com/",
+        )
+
+    monkeypatch.setattr(engine, "_follow_chatgpt_auth_redirects", fake_follow)
+    monkeypatch.setattr(engine, "_complete_chatgpt_bridge_stage", lambda result, final_url, log_prefix: False)
+    monkeypatch.setattr(
+        engine,
+        "_perform_chatgpt_direct_auth_login",
+        lambda session_obj: (_ for _ in ()).throw(AssertionError("unexpected direct login fallback")),
+    )
+
+    result = RegistrationResult(success=False, logs=engine.logs)
+    ok = engine._bootstrap_chatgpt_web_session_direct(result)
+
+    assert ok is True
+    assert result.session_token == "session-bridge"
+    assert result.access_token == "access-bridge"
+    assert result.workspace_id == "ws-bridge"
+    assert bridge_calls == [
+        "https://auth.openai.com/api/accounts/authorize?client_id=app_X8zY6vW2pQ9tR3dE7nK1jL5gH",
+    ]
+    assert temp_session.calls[0][1] == "https://chatgpt.com/api/auth/callback/openai?code=cb-2&state=st-2"
+
+
+def test_bootstrap_chatgpt_web_session_direct_accepts_partial_logged_in_payload_for_resume(monkeypatch):
+    class TempSession:
+        def __init__(self):
+            self.cookies = {}
+
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.email = "tester@example.com"
+    engine.password = "pw-1"
+
+    monkeypatch.setattr("src.core.register.cffi_requests.Session", lambda *args, **kwargs: TempSession())
+    monkeypatch.setattr(
+        engine,
+        "_run_chatgpt_nextauth_bridge",
+        lambda session_obj, *, email, device_id, log_prefix: (
+            "https://auth.openai.com/api/accounts/authorize?client_id=app_X8zY6vW2pQ9tR3dE7nK1jL5gH",
+            "https://auth.openai.com/api/accounts/authorize?client_id=app_X8zY6vW2pQ9tR3dE7nK1jL5gH",
+        ),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_wait_for_chatgpt_web_session",
+        lambda session_obj, timeout=12: (
+            {
+                "accessToken": "access-partial",
+                "user": {
+                    "id": "user-partial",
+                    "customIds": {
+                        "account_id": "acct-partial",
+                        "workspace_id": "ws-partial",
+                    },
+                },
+            },
+            "",
+        ),
+    )
+    monkeypatch.setattr(
+        engine,
+        "_perform_chatgpt_direct_auth_login",
+        lambda session_obj: (_ for _ in ()).throw(AssertionError("unexpected direct login fallback")),
+    )
+
+    result = RegistrationResult(success=False, logs=engine.logs)
+    ok = engine._bootstrap_chatgpt_web_session_direct(result, allow_partial_success=True)
+
+    assert ok is True
+    assert result.session_token == ""
+    assert result.access_token == "access-partial"
+    assert result.account_id == "acct-partial"
+    assert result.workspace_id == "ws-partial"
 
 
 def test_run_registers_then_relogs_to_fetch_token():
