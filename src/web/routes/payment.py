@@ -31,6 +31,7 @@ from ...core.openai.payment import (
     open_url_incognito,
     check_subscription_status_detail,
 )
+from ...core.timezone_utils import utcnow_naive
 from ...core.openai.browser_bind import auto_bind_checkout_with_playwright
 from ...core.openai.random_billing import generate_random_billing_profile
 from ...core.openai.token_refresh import TokenRefreshManager
@@ -63,6 +64,29 @@ REGION_BLOCK_ERROR_KEYWORDS = (
     "country, region, or territory not supported",
     "request_forbidden",
 )
+
+
+def _is_retryable_subscription_check_error(error_message: Optional[str]) -> bool:
+    text = str(error_message or "").strip().lower()
+    if not text:
+        return False
+    retry_markers = (
+        "network_error",
+        "network",
+        "timeout",
+        "timed out",
+        "connection",
+        "temporarily",
+        "too many requests",
+        "http 429",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "rate limit",
+    )
+    return any(marker in text for marker in retry_markers)
+
 CHECKOUT_COUNTRY_CURRENCY_MAP = {
     "US": "USD",
     "GB": "GBP",
@@ -746,6 +770,9 @@ def _normalize_email_service_config_for_session_bootstrap(
     elif service_type == EmailServiceType.DUCK_MAIL:
         if "domain" in normalized and "default_domain" not in normalized:
             normalized["default_domain"] = normalized.pop("domain")
+    elif service_type == EmailServiceType.LUCKMAIL:
+        if "domain" in normalized and "preferred_domain" not in normalized:
+            normalized["preferred_domain"] = normalized.pop("domain")
 
     # IMAP/Outlook 等可按需使用代理；Temp-Mail/Freemail/CloudMail 强制直连。
     if proxy_url and "proxy_url" not in normalized and service_type not in (EmailServiceType.TEMP_MAIL, EmailServiceType.FREEMAIL, EmailServiceType.CLOUDMAIL):
@@ -945,7 +972,7 @@ def _bootstrap_session_token_by_relogin(db, account: Account, proxy: Optional[st
                 account.cookies = fresh_cookies
                 if forced_access:
                     account.access_token = forced_access
-                account.last_refresh = datetime.utcnow()
+                account.last_refresh = utcnow_naive()
                 db.commit()
             return ""
 
@@ -954,7 +981,7 @@ def _bootstrap_session_token_by_relogin(db, account: Account, proxy: Optional[st
         if fresh_cookies:
             account.cookies = fresh_cookies
         account.session_token = session_token
-        account.last_refresh = datetime.utcnow()
+        account.last_refresh = utcnow_naive()
         db.commit()
         db.refresh(account)
         logger.info("会话补全登录成功: account_id=%s email=%s", account.id, account.email)
@@ -1210,7 +1237,7 @@ def _bootstrap_session_token_for_local_auto(db, account: Account, proxy: Optiona
                     account.refresh_token = refresh_result.refresh_token
                 if refresh_result.expires_at:
                     account.expires_at = refresh_result.expires_at
-                account.last_refresh = datetime.utcnow()
+                account.last_refresh = utcnow_naive()
                 db.commit()
                 db.refresh(account)
                 for proxy_item in proxy_candidates:
@@ -1284,7 +1311,7 @@ def _mask_card_number(number: Optional[str]) -> str:
 
 
 def _mark_task_paid_pending_sync(task: BindCardTask, reason: str) -> None:
-    now = datetime.utcnow()
+    now = utcnow_naive()
     task.status = "paid_pending_sync"
     task.completed_at = None
     task.last_checked_at = now
@@ -1791,7 +1818,7 @@ def _refresh_account_token_for_subscription_check(account: Account, proxy: Optio
         account.refresh_token = refresh_result.refresh_token
     if refresh_result.expires_at:
         account.expires_at = refresh_result.expires_at
-    account.last_refresh = datetime.utcnow()
+    account.last_refresh = utcnow_naive()
     return True, None
 
 
@@ -2167,7 +2194,7 @@ def get_account_session_diagnostic(
                 "probe": probe_result,
                 "notes": notes,
                 "recommendation": recommendation,
-                "checked_at": datetime.utcnow().isoformat(),
+                "checked_at": utcnow_naive().isoformat(),
             },
         }
 
@@ -2227,7 +2254,7 @@ def save_account_session_token(
         account.session_token = token
         if request.merge_cookie:
             account.cookies = _upsert_cookie(account.cookies, "__Secure-next-auth.session-token", token)
-        account.last_refresh = datetime.utcnow()
+        account.last_refresh = utcnow_naive()
         db.commit()
         db.refresh(account)
 
@@ -2376,7 +2403,7 @@ def create_bind_card_task(request: CreateBindCardTaskRequest):
             opened = open_url_incognito(link, account.cookies if account else None)
             if opened:
                 task.status = "opened"
-                task.opened_at = datetime.utcnow()
+                task.opened_at = utcnow_naive()
                 db.commit()
                 db.refresh(task)
                 logger.info("绑卡任务自动打开成功: task_id=%s mode=%s", task.id, bind_mode)
@@ -2420,7 +2447,7 @@ def list_bind_card_tasks(
         tasks = query.order_by(BindCardTask.created_at.desc()).offset(offset).limit(page_size).all()
 
         # 自动收敛任务状态：如果账号已是 plus/team，任务自动标记完成。
-        now = datetime.utcnow()
+        now = utcnow_naive()
         changed = False
         changed_count = 0
         for task in tasks:
@@ -2460,7 +2487,7 @@ def open_bind_card_task(task_id: int):
         if opened:
             if str(task.status or "") not in ("paid_pending_sync", "completed"):
                 task.status = "opened"
-            task.opened_at = datetime.utcnow()
+            task.opened_at = utcnow_naive()
             task.last_error = None
             db.commit()
             db.refresh(task)
@@ -2547,7 +2574,7 @@ def auto_bind_bind_card_task_third_party(task_id: int, request: ThirdPartyAutoBi
         task.bind_mode = "third_party"
         task.status = "verifying"
         task.last_error = None
-        task.last_checked_at = datetime.utcnow()
+        task.last_checked_at = utcnow_naive()
         db.commit()
 
         try:
@@ -2580,7 +2607,7 @@ def auto_bind_bind_card_task_third_party(task_id: int, request: ThirdPartyAutoBi
             if assess_state == "failed":
                 task.status = "failed"
                 task.last_error = f"第三方返回失败: {assess_reason or 'unknown'}"
-                task.last_checked_at = datetime.utcnow()
+                task.last_checked_at = utcnow_naive()
                 db.commit()
                 logger.warning(
                     "第三方自动绑卡返回业务失败: task_id=%s account_id=%s endpoint=%s reason=%s response=%s",
@@ -2600,7 +2627,7 @@ def auto_bind_bind_card_task_third_party(task_id: int, request: ThirdPartyAutoBi
                 # 若第三方明确返回 challenge/requires_action，直接切换待用户完成，避免无意义轮询超时。
                 if _is_third_party_challenge_pending(third_party_assessment):
                     task.status = "waiting_user_action"
-                    task.last_checked_at = datetime.utcnow()
+                    task.last_checked_at = utcnow_naive()
                     hint_reason = assess_reason or "requires_action"
                     hint_payment_status = payment_status or "unknown"
                     task.last_error = (
@@ -2660,13 +2687,13 @@ def auto_bind_bind_card_task_third_party(task_id: int, request: ThirdPartyAutoBi
                 if poll_state == "failed":
                     task.status = "failed"
                     task.last_error = f"第三方状态失败: {poll_reason or 'unknown'}"
-                    task.last_checked_at = datetime.utcnow()
+                    task.last_checked_at = utcnow_naive()
                     db.commit()
                     raise HTTPException(status_code=400, detail=f"第三方状态失败: {poll_reason or 'unknown'}")
 
                 if poll_state != "success":
                     task.status = "waiting_user_action"
-                    task.last_checked_at = datetime.utcnow()
+                    task.last_checked_at = utcnow_naive()
                     hint_reason = poll_reason or assess_reason or "pending_confirmation"
                     hint_payment_status = poll_payment_status or payment_status or "unknown"
                     task.last_error = (
@@ -2735,7 +2762,7 @@ def auto_bind_bind_card_task_third_party(task_id: int, request: ThirdPartyAutoBi
         except Exception as exc:
             task.status = "failed"
             task.last_error = f"第三方绑卡提交失败: {exc}"
-            task.last_checked_at = datetime.utcnow()
+            task.last_checked_at = utcnow_naive()
             db.commit()
             logger.warning("第三方自动绑卡提交失败: task_id=%s error=%s", task.id, exc)
             raise HTTPException(status_code=500, detail=str(exc))
@@ -2773,7 +2800,7 @@ def auto_bind_bind_card_task_local(task_id: int, request: LocalAutoBindRequest):
         task.bind_mode = "local_auto"
         task.status = "verifying"
         task.last_error = None
-        task.last_checked_at = datetime.utcnow()
+        task.last_checked_at = utcnow_naive()
         db.commit()
 
         logger.info(
@@ -2794,7 +2821,7 @@ def auto_bind_bind_card_task_local(task_id: int, request: LocalAutoBindRequest):
         )
         if not resolved_session_token and not runtime_proxy:
             task.status = "failed"
-            task.last_checked_at = datetime.utcnow()
+            task.last_checked_at = utcnow_naive()
             task.last_error = (
                 "当前账号缺少 session_token，且未检测到可用代理。"
                 "请在设置中配置代理（或为本次任务传入 proxy）后重试全自动。"
@@ -2815,7 +2842,7 @@ def auto_bind_bind_card_task_local(task_id: int, request: LocalAutoBindRequest):
             )
         if not resolved_session_token:
             task.status = "failed"
-            task.last_checked_at = datetime.utcnow()
+            task.last_checked_at = utcnow_naive()
             task.last_error = (
                 "会话补全未拿到 session_token。"
                 "请先在支付页执行“会话诊断/自动补会话”，"
@@ -2855,7 +2882,7 @@ def auto_bind_bind_card_task_local(task_id: int, request: LocalAutoBindRequest):
         except Exception as exc:
             task.status = "failed"
             task.last_error = f"本地自动绑卡执行异常: {exc}"
-            task.last_checked_at = datetime.utcnow()
+            task.last_checked_at = utcnow_naive()
             db.commit()
             logger.warning("本地自动绑卡执行异常: task_id=%s account_id=%s error=%s", task.id, account.id, exc)
             raise HTTPException(status_code=500, detail=f"本地自动绑卡执行失败: {exc}")
@@ -2870,7 +2897,7 @@ def auto_bind_bind_card_task_local(task_id: int, request: LocalAutoBindRequest):
         if not success:
             if "playwright not installed" in message.lower():
                 task.status = "failed"
-                task.last_checked_at = datetime.utcnow()
+                task.last_checked_at = utcnow_naive()
                 task.last_error = (
                     "本地自动绑卡环境缺少 Playwright/Chromium。"
                     "请先执行: pip install playwright && playwright install chromium"
@@ -2905,7 +2932,7 @@ def auto_bind_bind_card_task_local(task_id: int, request: LocalAutoBindRequest):
                     if manual_opened:
                         hint += " 已自动为你打开手动验证窗口。"
                 task.status = "waiting_user_action"
-                task.last_checked_at = datetime.utcnow()
+                task.last_checked_at = utcnow_naive()
                 task.last_error = hint
                 db.commit()
                 db.refresh(task)
@@ -2931,7 +2958,7 @@ def auto_bind_bind_card_task_local(task_id: int, request: LocalAutoBindRequest):
                 }
 
             task.status = "failed"
-            task.last_checked_at = datetime.utcnow()
+            task.last_checked_at = utcnow_naive()
             task.last_error = f"本地自动绑卡失败: {message or 'unknown_error'}"
             db.commit()
             logger.warning(
@@ -2983,7 +3010,7 @@ def sync_bind_card_task_subscription(task_id: int, request: SyncBindCardTaskRequ
             raise HTTPException(status_code=404, detail="任务关联账号不存在")
 
         proxy = _resolve_runtime_proxy(request.proxy, account)
-        now = datetime.utcnow()
+        now = utcnow_naive()
         try:
             detail, refreshed = _check_subscription_detail_with_retry(
                 db=db,
@@ -3093,7 +3120,7 @@ def mark_bind_card_task_user_action(task_id: int, request: MarkUserActionRequest
         )
 
         previous_status = str(task.status or "")
-        now = datetime.utcnow()
+        now = utcnow_naive()
         task.status = "verifying"
         task.last_error = None
         task.last_checked_at = now
@@ -3122,7 +3149,7 @@ def mark_bind_card_task_user_action(task_id: int, request: MarkUserActionRequest
                     task.id, checks, status, detail.get("source"), detail.get("confidence"), bool(detail.get("token_refreshed"))
                 )
             except Exception as exc:
-                failed_at = datetime.utcnow()
+                failed_at = utcnow_naive()
                 task.status = "failed"
                 task.last_error = f"订阅检测失败: {exc}"
                 task.last_checked_at = failed_at
@@ -3130,7 +3157,7 @@ def mark_bind_card_task_user_action(task_id: int, request: MarkUserActionRequest
                 logger.warning("绑卡任务验证失败: task_id=%s attempt=%s error=%s", task.id, checks, exc)
                 raise HTTPException(status_code=500, detail=f"订阅检测失败: {exc}")
 
-            checked_at = datetime.utcnow()
+            checked_at = utcnow_naive()
             if status in ("plus", "team"):
                 account.subscription_type = status
                 account.subscription_at = checked_at
@@ -3197,7 +3224,7 @@ def mark_bind_card_task_user_action(task_id: int, request: MarkUserActionRequest
         else:
             task.status = "waiting_user_action"
             task.last_error = timeout_msg + "请稍后点击“同步订阅”重试。"
-        task.last_checked_at = datetime.utcnow()
+        task.last_checked_at = utcnow_naive()
         task.completed_at = None
         db.commit()
         db.refresh(task)
@@ -3268,7 +3295,7 @@ def batch_check_subscription(request: BatchCheckSubscriptionRequest):
 
                 if status in ("plus", "team"):
                     account.subscription_type = status
-                    account.subscription_at = datetime.utcnow()
+                    account.subscription_at = utcnow_naive()
                 elif status == "free" and confidence == "high":
                     account.subscription_type = None
                     account.subscription_at = None
@@ -3308,7 +3335,7 @@ def mark_subscription(account_id: int, request: MarkSubscriptionRequest):
             raise HTTPException(status_code=404, detail="账号不存在")
 
         account.subscription_type = None if request.subscription_type == "free" else request.subscription_type
-        account.subscription_at = datetime.utcnow() if request.subscription_type != "free" else None
+        account.subscription_at = utcnow_naive() if request.subscription_type != "free" else None
         db.commit()
 
     return {"success": True, "subscription_type": request.subscription_type}

@@ -1,4 +1,4 @@
-<!DOCTYPE html>
+﻿<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
     <meta charset="UTF-8">
@@ -88,6 +88,56 @@
             filter: blur(0);
         }
 
+        .recent-role-cell {
+            display: inline-flex;
+            align-items: center;
+            gap: 6px;
+        }
+
+        .recent-role-badge {
+            display: inline-flex;
+            align-items: center;
+            justify-content: center;
+            min-width: 44px;
+            height: 22px;
+            padding: 0 8px;
+            border-radius: 999px;
+            border: 1px solid transparent;
+            font-size: 0.75rem;
+            font-weight: 600;
+            line-height: 1;
+            white-space: nowrap;
+        }
+
+        .recent-role-badge.parent {
+            color: #4f46e5;
+            background: rgba(99, 102, 241, 0.14);
+            border-color: rgba(99, 102, 241, 0.32);
+        }
+
+        .recent-role-badge.child {
+            color: #1d4ed8;
+            background: rgba(59, 130, 246, 0.14);
+            border-color: rgba(59, 130, 246, 0.32);
+        }
+
+        .recent-role-badge.none {
+            color: #64748b;
+            background: rgba(148, 163, 184, 0.12);
+            border-color: rgba(148, 163, 184, 0.3);
+        }
+
+        .recent-role-select {
+            min-width: 66px;
+            height: 24px;
+            border-radius: 8px;
+            border: 1px solid var(--border-color);
+            background: var(--surface-color);
+            color: var(--text-primary);
+            font-size: 0.75rem;
+            padding: 0 6px;
+        }
+
         .today-stats-strip {
             width: 100%;
             margin-left: 0;
@@ -100,6 +150,33 @@
             display: flex;
             justify-content: space-between;
             align-items: center;
+        }
+
+        .panel-stack {
+            display: flex;
+            flex-direction: column;
+            gap: var(--spacing-lg);
+        }
+
+        .schedule-form-grid {
+            display: grid;
+            grid-template-columns: repeat(2, minmax(0, 1fr));
+            gap: var(--spacing-sm) var(--spacing-md);
+        }
+
+        .schedule-form-grid .form-group.full-width {
+            grid-column: 1 / -1;
+        }
+
+        .schedule-table-actions {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 6px;
+        }
+
+        .schedule-muted {
+            color: var(--text-muted);
+            font-size: 0.75rem;
         }
 
         .today-stats-reset {
@@ -161,18 +238,18 @@
             color: var(--stat-color, #60a5fa);
         }
 
-        .today-stat-total { --stat-color: #60a5fa; }
-        .today-stat-success { --stat-color: #22c55e; }
+        .today-stat-total { --stat-color: var(--secondary-accent); }
+        .today-stat-success { --stat-color: var(--primary-color); }
         .today-stat-failed { --stat-color: #ef4444; }
         .today-stat-rate { --stat-color: #f59e0b; }
 
         .today-stat-rate .today-stat-value {
             font-size: clamp(1.7rem, 2.3vw, 2.05rem);
         }
-        .today-stat-rate .today-stat-value.rate-high { color: #22c55e; }
+        .today-stat-rate .today-stat-value.rate-high { color: var(--primary-color); }
         .today-stat-rate .today-stat-value.rate-low { color: #ef4444; }
         .today-stat-rate .today-stat-value.rate-mid { color: #f59e0b; }
-        .today-stat-rate.rate-high { --stat-color: #22c55e; }
+        .today-stat-rate.rate-high { --stat-color: var(--primary-color); }
         .today-stat-rate.rate-low { --stat-color: #ef4444; }
         .today-stat-rate.rate-mid { --stat-color: #f59e0b; }
 
@@ -236,11 +313,14 @@
             .today-stats-grid {
                 grid-template-columns: repeat(2, minmax(0, 1fr));
             }
+
+            .schedule-form-grid {
+                grid-template-columns: 1fr;
+            }
         }
     </style>
 </head>
 <body>
-    {% include "partials/site_notice.html" %}
     <div class="container">
         <!-- 导航栏 -->
         <nav class="navbar">
@@ -250,18 +330,18 @@
             <div class="nav-links">
                 <a href="/" class="nav-link active">注册</a>
                 <a href="/accounts" class="nav-link">账号管理</a>
-                <a href="/accounts-overview" class="nav-link">账号总览</a>
                 <a href="/email-services" class="nav-link">邮箱服务</a>
                 <a href="/payment" class="nav-link">支付</a>
                 <a href="/card-pool" class="nav-link">卡池</a>
-                <a href="/auto-team" class="nav-link">自动进team</a>
+                <a href="/auto-team" class="nav-link">team</a>
                 <a href="/logs" class="nav-link">后台日志</a>
                 <a href="/settings" class="nav-link">设置</a>
                 <a href="/logout" class="nav-link">退出</a>
             </div>
-            <button class="theme-toggle" onclick="theme.toggle()" title="切换主题">
-                🌙
-            </button>
+                        <div class="nav-actions">
+            <a href="/selfcheck" class="selfcheck-toggle" title="系统自检">⚙️</a>
+            <button class="theme-toggle" onclick="theme.toggle()" title="切换主题">🌙</button>
+        </div>
         </nav>
 
         <!-- 主内容区 - 两栏布局 -->
@@ -296,6 +376,7 @@
             <div class="two-column-layout">
                 <!-- 左侧面板 - 注册设置 -->
                 <div class="left-panel">
+                    <div class="panel-stack">
                     <div class="card">
                         <div class="card-header">
                             <h3>📝 注册设置</h3>
@@ -312,6 +393,8 @@
                                         <option value="temp_mail">Temp-Mail 自部署</option>
                                         <option value="cloudmail">CloudMail</option>
                                         <option value="duck_mail">DuckMail</option>
+                                        <option value="freemail">Freemail</option>
+                                        <option value="luckmail">LuckMail</option>
                                         <option value="imap_mail">IMAP 邮箱</option>
                                         <option value="outlook_batch:all">Outlook 批量注册</option>
                                     </select>
@@ -367,6 +450,25 @@
                                     <select id="reg-mode" name="reg_mode">
                                         <option value="single">单次注册</option>
                                         <option value="batch">批量注册</option>
+                                        <option value="auto">自动注册</option>
+                                    </select>
+                                </div>
+
+                                <div class="form-group" id="registration-type-group">
+                                    <label for="registration-type">注册类型</label>
+                                    <select id="registration-type" name="registration_type">
+                                        <option value="child">子号</option>
+                                        <option value="parent">主号</option>
+                                        <option value="none">普通号</option>
+                                    </select>
+                                </div>
+
+                                <div class="form-group" id="registration-type-group">
+                                    <label for="registration-type">注册类型</label>
+                                    <select id="registration-type" name="registration_type">
+                                        <option value="none" selected>普通</option>
+                                        <option value="mother">母号</option>
+                                        <option value="child">子号</option>
                                     </select>
                                 </div>
 
@@ -403,6 +505,90 @@
                                     </div>
                                 </div>
 
+                                <div id="auto-registration-section" style="display: none; margin-top: var(--spacing-md); padding-top: var(--spacing-md); border-top: 1px solid var(--border-light);">
+                                    <div class="form-group">
+                                        <label style="font-weight: 600; margin-bottom: 4px; display: block;">自动注册补货</label>
+                                        <small style="color: var(--text-muted); display: block; margin-bottom: var(--spacing-sm);">按间隔检查目标 CPA 服务的 auth-files（仅 codex），低于阈值时自动补货</small>
+                                        <label style="display: flex; align-items: center; gap: var(--spacing-sm); cursor: pointer;">
+                                            <input type="checkbox" id="auto-registration-enabled" name="auto_enabled">
+                                            <span>启用自动注册</span>
+                                        </label>
+                                    </div>
+
+                                    <div class="form-row">
+                                        <div class="form-group">
+                                            <label for="auto-registration-check-interval">检查间隔 (秒)</label>
+                                            <input type="number" id="auto-registration-check-interval" value="60" min="5" max="3600">
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="auto-registration-min-ready">保底可用 auth-files 数量</label>
+                                            <input type="number" id="auto-registration-min-ready" value="1" min="1" max="10000">
+                                        </div>
+                                    </div>
+
+                                    <div class="form-row">
+                                        <div class="form-group">
+                                            <label for="auto-registration-cpa-service-id">监控 CPA 服务</label>
+                                            <select id="auto-registration-cpa-service-id">
+                                                <option value="0">请选择 CPA 服务</option>
+                                            </select>
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="auto-registration-email-service-type">邮箱服务类型</label>
+                                            <select id="auto-registration-email-service-type">
+                                                <option value="tempmail">Tempmail.lol</option>
+                                                <option value="yyds_mail">YYDS Mail</option>
+                                                <option value="outlook">Outlook</option>
+                                                <option value="moe_mail">MoeMail</option>
+                                                <option value="temp_mail">Temp-Mail 自部署</option>
+                                                <option value="cloudmail">CloudMail</option>
+                                                <option value="duck_mail">DuckMail</option>
+                                                <option value="freemail">Freemail</option>
+                                                <option value="luckmail">LuckMail</option>
+                                                <option value="imap_mail">IMAP 邮箱</option>
+                                            </select>
+                                        </div>
+                                    </div>
+
+                                    <div class="form-row">
+                                        <div class="form-group">
+                                            <label for="auto-registration-email-service-id">指定邮箱服务 ID（可选）</label>
+                                            <select id="auto-registration-email-service-id">
+                                                <option value="0">自动选择</option>
+                                            </select>
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="auto-registration-proxy">固定代理（可选）</label>
+                                            <input type="text" id="auto-registration-proxy" placeholder="留空则沿用现有代理策略">
+                                        </div>
+                                    </div>
+
+                                    <div class="form-row">
+                                        <div class="form-group">
+                                            <label for="auto-registration-mode">批量模式</label>
+                                            <select id="auto-registration-mode">
+                                                <option value="pipeline">流水线（Pipeline）</option>
+                                                <option value="parallel">并行（Parallel）</option>
+                                            </select>
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="auto-registration-concurrency">并发数</label>
+                                            <input type="number" id="auto-registration-concurrency" value="1" min="1" max="100">
+                                        </div>
+                                    </div>
+
+                                    <div class="form-row" id="auto-registration-interval-group">
+                                        <div class="form-group">
+                                            <label for="auto-registration-interval-min">最小启动间隔 (秒)</label>
+                                            <input type="number" id="auto-registration-interval-min" value="5" min="0">
+                                        </div>
+                                        <div class="form-group">
+                                            <label for="auto-registration-interval-max">最大启动间隔 (秒)</label>
+                                            <input type="number" id="auto-registration-interval-max" value="30" min="1">
+                                        </div>
+                                    </div>
+                                </div>
+
                                 <div class="form-group" id="auto-upload-group">
                                     <label style="font-weight: 500; margin-bottom: var(--spacing-xs); display: block;">注册后自动操作</label>
 
@@ -429,8 +615,17 @@
                                         <input type="checkbox" id="auto-upload-tm">
                                         <span>上传到 Team Manager</span>
                                     </label>
-                                    <div id="tm-service-select-group" style="display:none; margin-top: 6px; padding-left: 4px;">
+                                    <div id="tm-service-select-group" style="display:none; margin-top: 6px; margin-bottom: 8px; padding-left: 4px;">
                                         <div class="multi-select-dropdown" id="tm-service-select"></div>
+                                    </div>
+
+                                    <!-- new-api -->
+                                    <label style="display: flex; align-items: center; gap: var(--spacing-sm); cursor: pointer; margin-top: 6px;">
+                                        <input type="checkbox" id="auto-upload-new-api">
+                                        <span>上传到 new-api</span>
+                                    </label>
+                                    <div id="new-api-service-select-group" style="display:none; margin-top: 6px; padding-left: 4px;">
+                                        <div class="multi-select-dropdown" id="new-api-service-select"></div>
                                     </div>
                                 </div>
 
@@ -445,19 +640,82 @@
                             </form>
                         </div>
                     </div>
+
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>⏰ 计划注册-上传</h3>
+                        </div>
+                        <div class="card-body">
+                            <form id="schedule-form">
+                                <div class="schedule-form-grid">
+                                    <div class="form-group full-width">
+                                        <label for="schedule-name">计划名称</label>
+                                        <input type="text" id="schedule-name" maxlength="100" placeholder="例如：每 3 天定时注册并上传">
+                                    </div>
+
+                                    <div class="form-group">
+                                        <label for="schedule-trigger-type">触发方式</label>
+                                        <select id="schedule-trigger-type">
+                                            <option value="interval">固定间隔</option>
+                                            <option value="timepoint">周期性时间点</option>
+                                        </select>
+                                    </div>
+
+                                    <div class="form-group">
+                                        <label for="schedule-enabled">启用状态</label>
+                                        <select id="schedule-enabled">
+                                            <option value="true">启用</option>
+                                            <option value="false">暂停</option>
+                                        </select>
+                                    </div>
+
+                                    <div id="schedule-interval-fields" class="form-group full-width">
+                                        <label for="schedule-interval-minutes">间隔分钟数</label>
+                                        <input type="number" id="schedule-interval-minutes" min="1" value="60">
+                                    </div>
+
+                                    <div id="schedule-timepoint-fields" class="full-width" style="display: none;">
+                                        <div class="schedule-form-grid">
+                                            <div class="form-group">
+                                                <label for="schedule-every-n-days">每几天触发</label>
+                                                <input type="number" id="schedule-every-n-days" min="1" value="1">
+                                            </div>
+                                            <div class="form-group">
+                                                <label for="schedule-time-of-day">触发时间</label>
+                                                <input type="time" id="schedule-time-of-day" value="09:00">
+                                            </div>
+                                            <div class="form-group full-width">
+                                                <label for="schedule-start-date">开始日期</label>
+                                                <input type="date" id="schedule-start-date">
+                                                <div class="schedule-muted">不填则默认从今天开始计算周期。</div>
+                                            </div>
+                                        </div>
+                                    </div>
+                                </div>
+
+                                <div class="form-actions" style="margin-top: var(--spacing-md); flex-direction: column;">
+                                    <button type="submit" class="btn btn-primary" id="save-schedule-btn" style="width: 100%;">保存计划任务</button>
+                                    <button type="button" class="btn btn-secondary" id="cancel-schedule-edit-btn" style="width: 100%; display: none;">取消编辑</button>
+                                </div>
+                            </form>
+                        </div>
+                    </div>
+                    </div>
                 </div>
 
                 <!-- 右侧面板 -->
                 <div class="right-panel">
                     <!-- 监控台 -->
                     <div class="card" id="console-card">
-                        <div class="card-header">
-                            <h3>💻 监控台</h3>
-                            <div style="display: flex; gap: var(--spacing-sm); align-items: center;">
-                                <span id="task-status-badge" class="status-badge pending" style="display: none;">等待中</span>
-                                <button class="btn btn-ghost btn-sm" id="clear-log-btn">清空</button>
+                            <div class="card-header">
+                                <h3>💻 监控台</h3>
+                                <div style="display: flex; gap: var(--spacing-sm); align-items: center;">
+                                    <span id="task-status-badge" class="status-badge pending" style="display: none;">等待中</span>
+                                    <span id="auto-monitor-status-badge" class="status-badge pending" style="display: none;">自动注册</span>
+                                    <span id="auto-monitor-last-checked" style="font-size: 0.85rem; color: var(--text-muted); display: none;">最近检查: -</span>
+                                    <button class="btn btn-ghost btn-sm" id="clear-log-btn">清空</button>
+                                </div>
                             </div>
-                        </div>
                         <div class="card-body" style="padding: 0;">
                             <!-- 任务状态行 -->
                             <div class="task-status-row" id="task-status-row" style="display: none;">
@@ -476,6 +734,14 @@
                                 <div class="task-status-item">
                                     <div class="label">状态</div>
                                     <div class="value" id="task-status">-</div>
+                                </div>
+                                <div class="task-status-item">
+                                    <div class="label">最近检查</div>
+                                    <div class="value" id="task-last-checked">-</div>
+                                </div>
+                                <div class="task-status-item">
+                                    <div class="label">Codex 库存</div>
+                                    <div class="value" id="task-inventory">-</div>
                                 </div>
                             </div>
 
@@ -502,6 +768,37 @@
                         </div>
                     </div>
 
+                    <div class="card">
+                        <div class="card-header">
+                            <h3>🗓️ 计划任务列表</h3>
+                            <button class="btn btn-ghost btn-sm" id="refresh-schedules-btn">🔄 刷新</button>
+                        </div>
+                        <div class="card-body" style="padding: 0;">
+                            <table class="data-table">
+                                <thead>
+                                    <tr>
+                                        <th>计划名称</th>
+                                        <th>触发方式</th>
+                                        <th>下次执行</th>
+                                        <th>最近执行</th>
+                                        <th>状态</th>
+                                        <th>操作</th>
+                                    </tr>
+                                </thead>
+                                <tbody id="schedule-jobs-table">
+                                    <tr>
+                                        <td colspan="6">
+                                            <div class="empty-state" style="padding: var(--spacing-md);">
+                                                <div class="empty-state-icon">🗓️</div>
+                                                <div class="empty-state-title">暂无计划任务</div>
+                                            </div>
+                                        </td>
+                                    </tr>
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+
                     <!-- 已注册账号列表 -->
                     <div class="card">
                         <div class="card-header">
@@ -519,6 +816,7 @@
                                             <th style="width: 50px;">ID</th>
                                             <th>邮箱</th>
                                             <th style="width: 120px;">密码</th>
+                                            <th style="width: 150px;">标签</th>
                                             <th style="width: 80px;">状态</th>
                                         </tr>
                                     </thead>
@@ -543,5 +841,13 @@
 
     <script src="/static/js/utils.js?v={{ static_version }}"></script>
     <script src="/static/js/app.js?v={{ static_version }}"></script>
+    {% include "partials/site_footer.html" %}
 </body>
 </html>
+
+
+
+
+
+
+

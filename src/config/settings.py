@@ -48,7 +48,7 @@ SETTING_DEFINITIONS: Dict[str, SettingDefinition] = {
     ),
     "app_version": SettingDefinition(
         db_key="app.version",
-        default_value="1.1.1",
+        default_value="1.1.2",
         category=SettingCategory.GENERAL,
         description="应用版本"
     ),
@@ -93,6 +93,66 @@ SETTING_DEFINITIONS: Dict[str, SettingDefinition] = {
         category=SettingCategory.WEBUI,
         description="Web UI 访问密码",
         is_secret=True
+    ),
+    "auto_quick_refresh_enabled": SettingDefinition(
+        db_key="webui.auto_quick_refresh.enabled",
+        default_value=False,
+        category=SettingCategory.WEBUI,
+        description="是否启用账号管理自动一键刷新"
+    ),
+    "auto_quick_refresh_interval_minutes": SettingDefinition(
+        db_key="webui.auto_quick_refresh.interval_minutes",
+        default_value=30,
+        category=SettingCategory.WEBUI,
+        description="账号管理自动一键刷新间隔（分钟）"
+    ),
+    "auto_quick_refresh_retry_limit": SettingDefinition(
+        db_key="webui.auto_quick_refresh.retry_limit",
+        default_value=2,
+        category=SettingCategory.WEBUI,
+        description="账号管理自动一键刷新失败重试次数"
+    ),
+    "selfcheck_auto_enabled": SettingDefinition(
+        db_key="webui.selfcheck.auto_enabled",
+        default_value=False,
+        category=SettingCategory.WEBUI,
+        description="是否启用系统自检定时巡检"
+    ),
+    "selfcheck_interval_minutes": SettingDefinition(
+        db_key="webui.selfcheck.interval_minutes",
+        default_value=15,
+        category=SettingCategory.WEBUI,
+        description="系统自检定时巡检间隔（分钟）"
+    ),
+    "selfcheck_mode": SettingDefinition(
+        db_key="webui.selfcheck.mode",
+        default_value="quick",
+        category=SettingCategory.WEBUI,
+        description="系统自检定时巡检模式（quick/full）"
+    ),
+    "circuit_breaker_enabled": SettingDefinition(
+        db_key="runtime.circuit_breaker.enabled",
+        default_value=True,
+        category=SettingCategory.WEBUI,
+        description="是否启用失败熔断器"
+    ),
+    "circuit_breaker_failure_threshold": SettingDefinition(
+        db_key="runtime.circuit_breaker.failure_threshold",
+        default_value=5,
+        category=SettingCategory.WEBUI,
+        description="熔断触发连续失败次数阈值"
+    ),
+    "circuit_breaker_cooldown_seconds": SettingDefinition(
+        db_key="runtime.circuit_breaker.cooldown_seconds",
+        default_value=180,
+        category=SettingCategory.WEBUI,
+        description="熔断冷却时长（秒）"
+    ),
+    "circuit_breaker_probe_interval_seconds": SettingDefinition(
+        db_key="runtime.circuit_breaker.probe_interval_seconds",
+        default_value=30,
+        category=SettingCategory.WEBUI,
+        description="冷却结束后自动探活最小间隔（秒）"
     ),
 
     # 日志配置
@@ -256,6 +316,72 @@ SETTING_DEFINITIONS: Dict[str, SettingDefinition] = {
     ),
 
     # 邮箱服务配置
+    "registration_auto_enabled": SettingDefinition(
+        db_key="registration.auto.enabled",
+        default_value=False,
+        category=SettingCategory.REGISTRATION,
+        description="是否启用自动注册补货"
+    ),
+    "registration_auto_check_interval": SettingDefinition(
+        db_key="registration.auto.check_interval",
+        default_value=60,
+        category=SettingCategory.REGISTRATION,
+        description="自动注册库存检查间隔（秒）"
+    ),
+    "registration_auto_min_ready_auth_files": SettingDefinition(
+        db_key="registration.auto.min_ready_auth_files",
+        default_value=1,
+        category=SettingCategory.REGISTRATION,
+        description="自动注册保底可用认证文件数量"
+    ),
+    "registration_auto_email_service_type": SettingDefinition(
+        db_key="registration.auto.email_service_type",
+        default_value="tempmail",
+        category=SettingCategory.REGISTRATION,
+        description="自动注册使用的邮箱服务类型"
+    ),
+    "registration_auto_email_service_id": SettingDefinition(
+        db_key="registration.auto.email_service_id",
+        default_value=0,
+        category=SettingCategory.REGISTRATION,
+        description="自动注册绑定的邮箱服务 ID（0 表示自动选择）"
+    ),
+    "registration_auto_proxy": SettingDefinition(
+        db_key="registration.auto.proxy",
+        default_value="",
+        category=SettingCategory.REGISTRATION,
+        description="自动注册固定代理地址（留空则沿用系统策略）"
+    ),
+    "registration_auto_interval_min": SettingDefinition(
+        db_key="registration.auto.interval_min",
+        default_value=5,
+        category=SettingCategory.REGISTRATION,
+        description="自动注册批量任务最小启动间隔（秒）"
+    ),
+    "registration_auto_interval_max": SettingDefinition(
+        db_key="registration.auto.interval_max",
+        default_value=30,
+        category=SettingCategory.REGISTRATION,
+        description="自动注册批量任务最大启动间隔（秒）"
+    ),
+    "registration_auto_concurrency": SettingDefinition(
+        db_key="registration.auto.concurrency",
+        default_value=1,
+        category=SettingCategory.REGISTRATION,
+        description="自动注册批量任务并发数"
+    ),
+    "registration_auto_mode": SettingDefinition(
+        db_key="registration.auto.mode",
+        default_value="pipeline",
+        category=SettingCategory.REGISTRATION,
+        description="自动注册批量任务模式"
+    ),
+    "registration_auto_cpa_service_id": SettingDefinition(
+        db_key="registration.auto.cpa_service_id",
+        default_value=0,
+        category=SettingCategory.REGISTRATION,
+        description="自动注册监控并回传的 CPA 服务 ID"
+    ),
     "email_service_priority": SettingDefinition(
         db_key="email.service_priority",
         default_value={"tempmail": 0, "yyds_mail": 1, "outlook": 2, "moe_mail": 3},
@@ -264,17 +390,17 @@ SETTING_DEFINITIONS: Dict[str, SettingDefinition] = {
     ),
 
     # Tempmail.lol 配置
-    "tempmail_enabled": SettingDefinition(
-        db_key="tempmail.enabled",
-        default_value=True,
-        category=SettingCategory.TEMPMAIL,
-        description="是否启用 Tempmail 渠道"
-    ),
     "tempmail_base_url": SettingDefinition(
         db_key="tempmail.base_url",
         default_value="https://api.tempmail.lol/v2",
         category=SettingCategory.TEMPMAIL,
         description="Tempmail API 地址"
+    ),
+    "tempmail_enabled": SettingDefinition(
+        db_key="tempmail.enabled",
+        default_value=True,
+        category=SettingCategory.TEMPMAIL,
+        description="是否启用 Tempmail.lol 渠道"
     ),
     "tempmail_timeout": SettingDefinition(
         db_key="tempmail.timeout",
@@ -444,12 +570,33 @@ SETTING_TYPES: Dict[str, Type] = {
     "proxy_enabled": bool,
     "proxy_port": int,
     "proxy_dynamic_enabled": bool,
+    "auto_quick_refresh_enabled": bool,
+    "auto_quick_refresh_interval_minutes": int,
+    "auto_quick_refresh_retry_limit": int,
+    "selfcheck_auto_enabled": bool,
+    "selfcheck_interval_minutes": int,
+    "selfcheck_mode": str,
+    "circuit_breaker_enabled": bool,
+    "circuit_breaker_failure_threshold": int,
+    "circuit_breaker_cooldown_seconds": int,
+    "circuit_breaker_probe_interval_seconds": int,
     "registration_max_retries": int,
     "registration_timeout": int,
     "registration_default_password_length": int,
     "registration_sleep_min": int,
     "registration_sleep_max": int,
     "registration_entry_flow": str,
+    "registration_auto_enabled": bool,
+    "registration_auto_check_interval": int,
+    "registration_auto_min_ready_auth_files": int,
+    "registration_auto_email_service_type": str,
+    "registration_auto_email_service_id": int,
+    "registration_auto_proxy": str,
+    "registration_auto_interval_min": int,
+    "registration_auto_interval_max": int,
+    "registration_auto_concurrency": int,
+    "registration_auto_mode": str,
+    "registration_auto_cpa_service_id": int,
     "email_service_priority": dict,
     "tempmail_enabled": bool,
     "tempmail_timeout": int,
@@ -639,7 +786,7 @@ class Settings(BaseModel):
 
     # 应用信息
     app_name: str = "OpenAI/Codex CLI 自动注册系统"
-    app_version: str = "1.1.1"
+    app_version: str = "1.1.2"
     debug: bool = False
 
     # 数据库配置
@@ -666,6 +813,16 @@ class Settings(BaseModel):
     webui_port: int = 8000
     webui_secret_key: SecretStr = SecretStr("your-secret-key-change-in-production")
     webui_access_password: SecretStr = SecretStr("admin123")
+    auto_quick_refresh_enabled: bool = False
+    auto_quick_refresh_interval_minutes: int = 30
+    auto_quick_refresh_retry_limit: int = 2
+    selfcheck_auto_enabled: bool = False
+    selfcheck_interval_minutes: int = 15
+    selfcheck_mode: str = "quick"
+    circuit_breaker_enabled: bool = True
+    circuit_breaker_failure_threshold: int = 5
+    circuit_breaker_cooldown_seconds: int = 180
+    circuit_breaker_probe_interval_seconds: int = 30
 
     # 日志配置
     log_level: str = "INFO"
@@ -718,13 +875,24 @@ class Settings(BaseModel):
     registration_sleep_min: int = 5
     registration_sleep_max: int = 30
     registration_entry_flow: str = "native"
+    registration_auto_enabled: bool = False
+    registration_auto_check_interval: int = 60
+    registration_auto_min_ready_auth_files: int = 1
+    registration_auto_email_service_type: str = "tempmail"
+    registration_auto_email_service_id: int = 0
+    registration_auto_proxy: str = ""
+    registration_auto_interval_min: int = 5
+    registration_auto_interval_max: int = 30
+    registration_auto_concurrency: int = 1
+    registration_auto_mode: str = "pipeline"
+    registration_auto_cpa_service_id: int = 0
 
     # 邮箱服务配置
     email_service_priority: Dict[str, int] = {"tempmail": 0, "yyds_mail": 1, "outlook": 2, "moe_mail": 3}
 
     # Tempmail.lol 配置
-    tempmail_enabled: bool = True
     tempmail_base_url: str = "https://api.tempmail.lol/v2"
+    tempmail_enabled: bool = True
     tempmail_timeout: int = 30
     tempmail_max_retries: int = 3
     yyds_mail_enabled: bool = False

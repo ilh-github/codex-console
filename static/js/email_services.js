@@ -41,12 +41,11 @@ const elements = {
     tempmailApi: document.getElementById('tempmail-api'),
     tempmailEnabled: document.getElementById('tempmail-enabled'),
     testTempmailBtn: document.getElementById('test-tempmail-btn'),
-    yydsMailForm: document.getElementById('yyds-mail-form'),
-    yydsMailApi: document.getElementById('yyds-mail-api'),
-    yydsMailApiKey: document.getElementById('yyds-mail-api-key'),
-    yydsMailDomain: document.getElementById('yyds-mail-domain'),
-    yydsMailEnabled: document.getElementById('yyds-mail-enabled'),
-    testYydsMailBtn: document.getElementById('test-yyds-mail-btn'),
+    yydsApi: document.getElementById('yyds-api'),
+    yydsApiKey: document.getElementById('yyds-api-key'),
+    yydsDefaultDomain: document.getElementById('yyds-default-domain'),
+    yydsEnabled: document.getElementById('yyds-enabled'),
+    testYydsBtn: document.getElementById('test-yyds-btn'),
 
     // 添加自定义域名模态框
     addCustomModal: document.getElementById('add-custom-modal'),
@@ -55,9 +54,11 @@ const elements = {
     cancelAddCustom: document.getElementById('cancel-add-custom'),
     customSubType: document.getElementById('custom-sub-type'),
     addMoemailFields: document.getElementById('add-moemail-fields'),
-    addYydsMailFields: document.getElementById('add-yydsmail-fields'),
+    addTempmailBuiltinFields: document.getElementById('add-tempmail-builtin-fields'),
+    addYydsFields: document.getElementById('add-yyds-fields'),
     addTempmailFields: document.getElementById('add-tempmail-fields'),
     addDuckmailFields: document.getElementById('add-duckmail-fields'),
+    addLuckmailFields: document.getElementById('add-luckmail-fields'),
     addFreemailFields: document.getElementById('add-freemail-fields'),
     addImapFields: document.getElementById('add-imap-fields'),
 
@@ -67,9 +68,11 @@ const elements = {
     closeEditCustomModal: document.getElementById('close-edit-custom-modal'),
     cancelEditCustom: document.getElementById('cancel-edit-custom'),
     editMoemailFields: document.getElementById('edit-moemail-fields'),
-    editYydsMailFields: document.getElementById('edit-yydsmail-fields'),
+    editTempmailBuiltinFields: document.getElementById('edit-tempmail-builtin-fields'),
+    editYydsFields: document.getElementById('edit-yyds-fields'),
     editTempmailFields: document.getElementById('edit-tempmail-fields'),
     editDuckmailFields: document.getElementById('edit-duckmail-fields'),
+    editLuckmailFields: document.getElementById('edit-luckmail-fields'),
     editFreemailFields: document.getElementById('edit-freemail-fields'),
     editImapFields: document.getElementById('edit-imap-fields'),
     editCustomTypeBadge: document.getElementById('edit-custom-type-badge'),
@@ -83,11 +86,13 @@ const elements = {
 };
 
 const CUSTOM_SUBTYPE_LABELS = {
-    yydsmail: 'YYDS Mail (YYDS Mail API)',
     moemail: '🔗 MoeMail（自定义域名 API）',
+    tempmail_builtin: 'Tempmail.lol（官方渠道）',
+    yyds_mail: 'YYDS Mail（官方渠道）',
     tempmail: '📮 TempMail（自部署 Cloudflare Worker）',
-    cloudmail: '☁️ CloudMail（Cloudflare Worker）',
+    cloudmail: '☁️ CloudMail（自部署 Cloudflare Worker）',
     duckmail: '🦆 DuckMail（DuckMail API）',
+    luckmail: 'LuckMail（接码平台）',
     freemail: 'Freemail（自部署 Cloudflare Worker）',
     imap: '📧 IMAP 邮箱（Gmail/QQ/163等）'
 };
@@ -169,8 +174,7 @@ function initEventListeners() {
     // 临时邮箱配置
     elements.tempmailForm.addEventListener('submit', handleSaveTempmail);
     elements.testTempmailBtn.addEventListener('click', handleTestTempmail);
-    elements.yydsMailForm.addEventListener('submit', handleSaveYydsMail);
-    elements.testYydsMailBtn.addEventListener('click', handleTestYydsMail);
+    elements.testYydsBtn.addEventListener('click', handleTestYyds);
 
     // 点击其他地方关闭更多菜单
     document.addEventListener('click', () => {
@@ -194,9 +198,11 @@ function closeEmailMoreMenu(el) {
 function switchAddSubType(subType) {
     elements.customSubType.value = subType;
     elements.addMoemailFields.style.display = subType === 'moemail' ? '' : 'none';
-    elements.addYydsMailFields.style.display = subType === 'yydsmail' ? '' : 'none';
+    elements.addTempmailBuiltinFields.style.display = subType === 'tempmail_builtin' ? '' : 'none';
+    elements.addYydsFields.style.display = subType === 'yyds_mail' ? '' : 'none';
     elements.addTempmailFields.style.display = (subType === 'tempmail' || subType === 'cloudmail') ? '' : 'none';
     elements.addDuckmailFields.style.display = subType === 'duckmail' ? '' : 'none';
+    elements.addLuckmailFields.style.display = subType === 'luckmail' ? '' : 'none';
     elements.addFreemailFields.style.display = subType === 'freemail' ? '' : 'none';
     elements.addImapFields.style.display = subType === 'imap' ? '' : 'none';
 }
@@ -205,9 +211,11 @@ function switchAddSubType(subType) {
 function switchEditSubType(subType) {
     elements.editCustomSubTypeHidden.value = subType;
     elements.editMoemailFields.style.display = subType === 'moemail' ? '' : 'none';
-    elements.editYydsMailFields.style.display = subType === 'yydsmail' ? '' : 'none';
+    elements.editTempmailBuiltinFields.style.display = subType === 'tempmail_builtin' ? '' : 'none';
+    elements.editYydsFields.style.display = subType === 'yyds_mail' ? '' : 'none';
     elements.editTempmailFields.style.display = (subType === 'tempmail' || subType === 'cloudmail') ? '' : 'none';
     elements.editDuckmailFields.style.display = subType === 'duckmail' ? '' : 'none';
+    elements.editLuckmailFields.style.display = subType === 'luckmail' ? '' : 'none';
     elements.editFreemailFields.style.display = subType === 'freemail' ? '' : 'none';
     elements.editImapFields.style.display = subType === 'imap' ? '' : 'none';
     elements.editCustomTypeBadge.textContent = CUSTOM_SUBTYPE_LABELS[subType] || CUSTOM_SUBTYPE_LABELS.moemail;
@@ -218,7 +226,7 @@ async function loadStats() {
     try {
         const data = await api.get('/email-services/stats');
         elements.outlookCount.textContent = data.outlook_count || 0;
-        elements.customCount.textContent = (data.custom_count || 0) + (data.yyds_mail_count || 0) + (data.temp_mail_count || 0) + (data.cloudmail_count || 0) + (data.duck_mail_count || 0) + (data.freemail_count || 0) + (data.imap_mail_count || 0);
+        elements.customCount.textContent = (data.custom_count || 0) + (data.tempmail_builtin_count || 0) + (data.yyds_mail_count || 0) + (data.temp_mail_count || 0) + (data.cloudmail_count || 0) + (data.duck_mail_count || 0) + (data.luckmail_count || 0) + (data.freemail_count || 0) + (data.imap_mail_count || 0);
         elements.tempmailStatus.textContent = data.tempmail_available ? '可用' : '不可用';
         elements.totalEnabled.textContent = data.enabled_count || 0;
     } catch (error) {
@@ -235,7 +243,7 @@ async function loadOutlookServices() {
         if (outlookServices.length === 0) {
             elements.outlookTable.innerHTML = `
                 <tr>
-                    <td colspan="7">
+                    <td colspan="8">
                         <div class="empty-state">
                             <div class="empty-state-icon">📭</div>
                             <div class="empty-state-title">暂无 Outlook 账户</div>
@@ -254,9 +262,7 @@ async function loadOutlookServices() {
                 <td>
                     ${getOutlookAuthBadge(service)}
                 </td>
-                <td>
-                    ${getOutlookRegistrationBadge(service)}
-                </td>
+                <td>${getOutlookRegistrationBadge(service)}</td>
                 <td title="${service.enabled ? '已启用' : '已禁用'}">${service.enabled ? '✅' : '⭕'}</td>
                 <td>${service.priority}</td>
                 <td>${format.date(service.last_used)}</td>
@@ -275,6 +281,7 @@ async function loadOutlookServices() {
                 </td>
             </tr>
         `).join('');
+
         elements.outlookTable.querySelectorAll('input[type="checkbox"][data-id]').forEach(cb => {
             cb.addEventListener('change', (e) => {
                 const id = parseInt(e.target.dataset.id);
@@ -286,7 +293,7 @@ async function loadOutlookServices() {
 
     } catch (error) {
         console.error('加载 Outlook 服务失败:', error);
-        elements.outlookTable.innerHTML = `<tr><td colspan="7"><div class="empty-state"><div class="empty-state-icon">❌</div><div class="empty-state-title">加载失败</div></div></td></tr>`;
+        elements.outlookTable.innerHTML = `<tr><td colspan="8"><div class="empty-state"><div class="empty-state-icon">❌</div><div class="empty-state-title">加载失败</div></div></td></tr>`;
     }
 }
 
@@ -312,8 +319,11 @@ function getCustomServiceTypeBadge(subType) {
     if (subType === 'moemail') {
         return '<span class="status-badge info">MoeMail</span>';
     }
-    if (subType === 'yydsmail') {
-        return '<span class="status-badge" style="background-color:#455a64;color:white;">YYDS Mail</span>';
+    if (subType === 'tempmail_builtin') {
+        return '<span class="status-badge warning">Tempmail.lol</span>';
+    }
+    if (subType === 'yyds_mail') {
+        return '<span class="status-badge" style="background-color:#1565c0;color:white;">YYDS Mail</span>';
     }
     if (subType === 'tempmail') {
         return '<span class="status-badge warning">TempMail</span>';
@@ -323,6 +333,9 @@ function getCustomServiceTypeBadge(subType) {
     }
     if (subType === 'duckmail') {
         return '<span class="status-badge success">DuckMail</span>';
+    }
+    if (subType === 'luckmail') {
+        return '<span class="status-badge" style="background-color:#f57c00;color:white;">LuckMail</span>';
     }
     if (subType === 'freemail') {
         return '<span class="status-badge" style="background-color:#9c27b0;color:white;">Freemail</span>';
@@ -336,6 +349,28 @@ function getCustomServiceAddress(service) {
         const emailAddr = service.config?.email || '';
         return `${escapeHtml(host)}<div style="color: var(--text-muted); margin-top: 4px;">${escapeHtml(emailAddr)}</div>`;
     }
+    if (service._subType === 'tempmail_builtin') {
+        const baseUrl = service.config?.base_url || '-';
+        const timeout = service.config?.timeout || 30;
+        return `${escapeHtml(baseUrl)}<div style="color: var(--text-muted); margin-top: 4px;">超时：${escapeHtml(String(timeout))} 秒</div>`;
+    }
+    if (service._subType === 'yyds_mail') {
+        const baseUrl = service.config?.base_url || '-';
+        const domain = service.config?.default_domain || '';
+        if (!domain) {
+            return escapeHtml(baseUrl);
+        }
+        return `${escapeHtml(baseUrl)}<div style="color: var(--text-muted); margin-top: 4px;">默认域名：@${escapeHtml(domain)}</div>`;
+    }
+    if (service._subType === 'luckmail') {
+        const baseUrl = service.config?.base_url || '-';
+        const projectCode = service.config?.project_code || 'openai';
+        const preferredDomain = service.config?.preferred_domain || '';
+        const detail = preferredDomain
+            ? `项目：${escapeHtml(projectCode)} / 优先域名：${escapeHtml(preferredDomain)}`
+            : `项目：${escapeHtml(projectCode)}`;
+        return `${escapeHtml(baseUrl)}<div style="color: var(--text-muted); margin-top: 4px;">${detail}</div>`;
+    }
     const baseUrl = service.config?.base_url || '-';
     const domain = service.config?.default_domain || service.config?.domain;
     if (!domain) {
@@ -347,23 +382,27 @@ function getCustomServiceAddress(service) {
 // 加载自定义邮箱服务（moe_mail + temp_mail + cloudmail + duck_mail + freemail + imap_mail 合并）
 async function loadCustomServices() {
     try {
-        const [r1, r2, r3, r4, r5, r6, r7] = await Promise.all([
+        const [r1, r2, r3, r4, r5, r6, r7, r8, r9] = await Promise.all([
             api.get('/email-services?service_type=moe_mail'),
+            api.get('/email-services?service_type=tempmail'),
             api.get('/email-services?service_type=yyds_mail'),
             api.get('/email-services?service_type=temp_mail'),
             api.get('/email-services?service_type=cloudmail'),
             api.get('/email-services?service_type=duck_mail'),
+            api.get('/email-services?service_type=luckmail'),
             api.get('/email-services?service_type=freemail'),
             api.get('/email-services?service_type=imap_mail')
         ]);
         customServices = [
             ...(r1.services || []).map(s => ({ ...s, _subType: 'moemail' })),
-            ...(r2.services || []).map(s => ({ ...s, _subType: 'yydsmail' })),
-            ...(r3.services || []).map(s => ({ ...s, _subType: 'tempmail' })),
-            ...(r4.services || []).map(s => ({ ...s, _subType: 'cloudmail' })),
-            ...(r5.services || []).map(s => ({ ...s, _subType: 'duckmail' })),
-            ...(r6.services || []).map(s => ({ ...s, _subType: 'freemail' })),
-            ...(r7.services || []).map(s => ({ ...s, _subType: 'imap' }))
+            ...(r2.services || []).map(s => ({ ...s, _subType: 'tempmail_builtin' })),
+            ...(r3.services || []).map(s => ({ ...s, _subType: 'yyds_mail' })),
+            ...(r4.services || []).map(s => ({ ...s, _subType: 'tempmail' })),
+            ...(r5.services || []).map(s => ({ ...s, _subType: 'cloudmail' })),
+            ...(r6.services || []).map(s => ({ ...s, _subType: 'duckmail' })),
+            ...(r7.services || []).map(s => ({ ...s, _subType: 'luckmail' })),
+            ...(r8.services || []).map(s => ({ ...s, _subType: 'freemail' })),
+            ...(r9.services || []).map(s => ({ ...s, _subType: 'imap' }))
         ];
 
         if (customServices.length === 0) {
@@ -388,6 +427,7 @@ async function loadCustomServices() {
                 <td>${escapeHtml(service.name)}</td>
                 <td>${getCustomServiceTypeBadge(service._subType)}</td>
                 <td style="font-size: 0.75rem; min-width: 400px;">${getCustomServiceAddress(service)}</td>
+                <td>--</td>
                 <td title="${service.enabled ? '已启用' : '已禁用'}">${service.enabled ? '✅' : '⭕'}</td>
                 <td>${service.priority}</td>
                 <td>${format.date(service.last_used)}</td>
@@ -425,16 +465,15 @@ async function loadTempmailConfig() {
     try {
         const settings = await api.get('/settings');
         if (settings.tempmail) {
-            elements.tempmailApi.value = settings.tempmail.api_url || settings.tempmail.base_url || '';
+            elements.tempmailApi.value = settings.tempmail.api_url || '';
             elements.tempmailEnabled.checked = settings.tempmail.enabled !== false;
         }
         if (settings.yyds_mail) {
-            elements.yydsMailApi.value = settings.yyds_mail.api_url || settings.yyds_mail.base_url || '';
-            elements.yydsMailDomain.value = settings.yyds_mail.default_domain || '';
-            elements.yydsMailEnabled.checked = settings.yyds_mail.enabled === true;
-            elements.yydsMailApiKey.value = '';
-            elements.yydsMailApiKey.dataset.hasKey = settings.yyds_mail.has_api_key ? 'true' : 'false';
-            elements.yydsMailApiKey.placeholder = settings.yyds_mail.has_api_key ? '已设置，留空保持不变' : 'AC-your_api_key';
+            elements.yydsApi.value = settings.yyds_mail.api_url || '';
+            elements.yydsDefaultDomain.value = settings.yyds_mail.default_domain || '';
+            elements.yydsEnabled.checked = settings.yyds_mail.enabled === true;
+            elements.yydsApiKey.value = '';
+            elements.yydsApiKey.placeholder = settings.yyds_mail.has_api_key ? '已设置，留空保持不变' : '请输入 YYDS Mail API Key';
         }
     } catch (error) {
         // 忽略错误
@@ -493,12 +532,21 @@ async function handleAddCustom(e) {
             api_key: formData.get('api_key'),
             default_domain: formData.get('domain')
         };
-    } else if (subType === 'yydsmail') {
+    } else if (subType === 'tempmail_builtin') {
+        serviceType = 'tempmail';
+        config = {
+            base_url: formData.get('tpo_base_url'),
+            timeout: parseInt(formData.get('tpo_timeout'), 10) || 30,
+            max_retries: parseInt(formData.get('tpo_max_retries'), 10) || 3
+        };
+    } else if (subType === 'yyds_mail') {
         serviceType = 'yyds_mail';
         config = {
             base_url: formData.get('yyds_base_url'),
             api_key: formData.get('yyds_api_key'),
-            default_domain: formData.get('yyds_domain')
+            default_domain: formData.get('yyds_default_domain'),
+            timeout: parseInt(formData.get('yyds_timeout'), 10) || 30,
+            max_retries: parseInt(formData.get('yyds_max_retries'), 10) || 3
         };
     } else if (subType === 'tempmail' || subType === 'cloudmail') {
         serviceType = subType === 'cloudmail' ? 'cloudmail' : 'temp_mail';
@@ -517,6 +565,15 @@ async function handleAddCustom(e) {
             default_domain: formData.get('dm_domain'),
             password_length: parseInt(formData.get('dm_password_length'), 10) || 12
         };
+    } else if (subType === 'luckmail') {
+        serviceType = 'luckmail';
+        config = {
+            base_url: formData.get('lm_base_url'),
+            api_key: formData.get('lm_api_key'),
+            project_code: formData.get('lm_project_code') || 'openai',
+            email_type: formData.get('lm_email_type') || 'ms_graph',
+            preferred_domain: formData.get('lm_preferred_domain')
+        };
     } else if (subType === 'freemail') {
         serviceType = 'freemail';
         config = {
@@ -533,11 +590,6 @@ async function handleAddCustom(e) {
             email: formData.get('imap_email'),
             password: formData.get('imap_password')
         };
-    }
-
-    if (subType === 'yydsmail' && (!config.base_url || !config.api_key)) {
-        toast.error('YYDS Mail 需要填写 API URL 和 API Key');
-        return;
     }
 
     const data = {
@@ -624,12 +676,19 @@ async function handleBatchDeleteOutlook() {
 async function handleSaveTempmail(e) {
     e.preventDefault();
     try {
-        await api.post('/settings/tempmail', {
+        const payload = {
             api_url: elements.tempmailApi.value,
-            enabled: elements.tempmailEnabled.checked
-        });
+            enabled: elements.tempmailEnabled.checked,
+            yyds_api_url: elements.yydsApi.value,
+            yyds_default_domain: elements.yydsDefaultDomain.value,
+            yyds_enabled: elements.yydsEnabled.checked
+        };
+        const yydsApiKey = elements.yydsApiKey.value.trim();
+        if (yydsApiKey) {
+            payload.yyds_api_key = yydsApiKey;
+        }
+        await api.post('/settings/tempmail', payload);
         toast.success('配置已保存');
-        loadStats();
     } catch (error) {
         toast.error('保存失败: ' + error.message);
     }
@@ -638,10 +697,9 @@ async function handleSaveTempmail(e) {
 // 测试临时邮箱
 async function handleTestTempmail() {
     elements.testTempmailBtn.disabled = true;
-    elements.testTempmailBtn.textContent = '测试中...';
+    elements.testTempmailBtn.textContent = '测试 Tempmail.lol 中...';
     try {
         const result = await api.post('/email-services/test-tempmail', {
-            provider: 'tempmail',
             api_url: elements.tempmailApi.value
         });
         if (result.success) toast.success('临时邮箱连接正常');
@@ -650,66 +708,30 @@ async function handleTestTempmail() {
         toast.error('测试失败: ' + error.message);
     } finally {
         elements.testTempmailBtn.disabled = false;
-        elements.testTempmailBtn.textContent = '🔌 测试连接';
+        elements.testTempmailBtn.textContent = '🔌 测试 Tempmail.lol';
     }
 }
 
-// 保存 YYDS Mail 配置
-async function handleSaveYydsMail(e) {
-    e.preventDefault();
-    const apiKey = elements.yydsMailApiKey.value.trim();
-    const hasSavedKey = elements.yydsMailApiKey.dataset.hasKey === 'true';
-
-    if (elements.yydsMailEnabled.checked && !apiKey && !hasSavedKey) {
-        toast.error('启用 YYDS Mail 前请先填写 API Key');
-        return;
-    }
-
-    const payload = {
-        yyds_api_url: elements.yydsMailApi.value,
-        yyds_default_domain: elements.yydsMailDomain.value,
-        yyds_enabled: elements.yydsMailEnabled.checked
-    };
-    if (apiKey || !hasSavedKey) {
-        payload.yyds_api_key = apiKey;
-    }
-
-    try {
-        await api.post('/settings/tempmail', payload);
-        if (apiKey) {
-            elements.yydsMailApiKey.value = '';
-            elements.yydsMailApiKey.dataset.hasKey = 'true';
-            elements.yydsMailApiKey.placeholder = '已设置，留空保持不变';
-        } else if (!hasSavedKey && !apiKey) {
-            elements.yydsMailApiKey.dataset.hasKey = 'false';
-        }
-        toast.success('YYDS Mail 配置已保存');
-        loadStats();
-    } catch (error) {
-        toast.error('保存失败: ' + error.message);
-    }
-}
-
-// 测试 YYDS Mail
-async function handleTestYydsMail() {
-    elements.testYydsMailBtn.disabled = true;
-    elements.testYydsMailBtn.textContent = '测试中...';
+async function handleTestYyds() {
+    elements.testYydsBtn.disabled = true;
+    elements.testYydsBtn.textContent = '测试 YYDS Mail 中...';
     try {
         const payload = {
             provider: 'yyds_mail',
-            api_url: elements.yydsMailApi.value
+            api_url: elements.yydsApi.value
         };
-        const apiKey = elements.yydsMailApiKey.value.trim();
-        if (apiKey) payload.api_key = apiKey;
-
+        const apiKey = elements.yydsApiKey.value.trim();
+        if (apiKey) {
+            payload.api_key = apiKey;
+        }
         const result = await api.post('/email-services/test-tempmail', payload);
         if (result.success) toast.success('YYDS Mail 连接正常');
-        else toast.error('连接失败: ' + (result.error || '未知错误'));
+        else toast.error('连接失败: ' + (result.error || result.message || '未知错误'));
     } catch (error) {
         toast.error('测试失败: ' + error.message);
     } finally {
-        elements.testYydsMailBtn.disabled = false;
-        elements.testYydsMailBtn.textContent = '🔌 测试连接';
+        elements.testYydsBtn.disabled = false;
+        elements.testYydsBtn.textContent = '🔌 测试 YYDS Mail';
     }
 }
 
@@ -735,14 +757,18 @@ async function editCustomService(id, subType) {
     try {
         const service = await api.get(`/email-services/${id}/full`);
         const resolvedSubType = subType || (
-            service.service_type === 'temp_mail'
-                ? 'tempmail'
-                : service.service_type === 'cloudmail'
-                    ? 'cloudmail'
+            service.service_type === 'tempmail'
+                ? 'tempmail_builtin'
                 : service.service_type === 'yyds_mail'
-                    ? 'yydsmail'
+                    ? 'yyds_mail'
+                : service.service_type === 'temp_mail'
+                    ? 'tempmail'
+                    : service.service_type === 'cloudmail'
+                    ? 'cloudmail'
                 : service.service_type === 'duck_mail'
                     ? 'duckmail'
+                    : service.service_type === 'luckmail'
+                        ? 'luckmail'
                     : service.service_type === 'freemail'
                         ? 'freemail'
                         : service.service_type === 'imap_mail'
@@ -762,11 +788,17 @@ async function editCustomService(id, subType) {
             document.getElementById('edit-custom-api-key').value = '';
             document.getElementById('edit-custom-api-key').placeholder = service.config?.api_key ? '已设置，留空保持不变' : 'API Key';
             document.getElementById('edit-custom-domain').value = service.config?.default_domain || service.config?.domain || '';
-        } else if (resolvedSubType === 'yydsmail') {
+        } else if (resolvedSubType === 'tempmail_builtin') {
+            document.getElementById('edit-tpo-base-url').value = service.config?.base_url || '';
+            document.getElementById('edit-tpo-timeout').value = service.config?.timeout || 30;
+            document.getElementById('edit-tpo-max-retries').value = service.config?.max_retries || 3;
+        } else if (resolvedSubType === 'yyds_mail') {
             document.getElementById('edit-yyds-base-url').value = service.config?.base_url || '';
             document.getElementById('edit-yyds-api-key').value = '';
-            document.getElementById('edit-yyds-api-key').placeholder = service.config?.api_key ? '已设置，留空保持不变' : 'Enter API Key';
-            document.getElementById('edit-yyds-domain').value = service.config?.default_domain || service.config?.domain || '';
+            document.getElementById('edit-yyds-api-key').placeholder = service.config?.api_key ? '已设置，留空保持不变' : '请输入 API Key';
+            document.getElementById('edit-yyds-default-domain').value = service.config?.default_domain || '';
+            document.getElementById('edit-yyds-timeout').value = service.config?.timeout || 30;
+            document.getElementById('edit-yyds-max-retries').value = service.config?.max_retries || 3;
         } else if (resolvedSubType === 'tempmail' || resolvedSubType === 'cloudmail') {
             document.getElementById('edit-tm-base-url').value = service.config?.base_url || '';
             document.getElementById('edit-tm-admin-password').value = '';
@@ -780,6 +812,13 @@ async function editCustomService(id, subType) {
             document.getElementById('edit-dm-api-key').placeholder = service.config?.api_key ? '已设置，留空保持不变' : '请输入 API Key（可选）';
             document.getElementById('edit-dm-domain').value = service.config?.default_domain || '';
             document.getElementById('edit-dm-password-length').value = service.config?.password_length || 12;
+        } else if (resolvedSubType === 'luckmail') {
+            document.getElementById('edit-lm-base-url').value = service.config?.base_url || '';
+            document.getElementById('edit-lm-api-key').value = '';
+            document.getElementById('edit-lm-api-key').placeholder = service.config?.api_key ? '已设置，留空保持不变' : '请输入 API Key';
+            document.getElementById('edit-lm-project-code').value = service.config?.project_code || 'openai';
+            document.getElementById('edit-lm-email-type').value = service.config?.email_type || 'ms_graph';
+            document.getElementById('edit-lm-preferred-domain').value = service.config?.preferred_domain || '';
         } else if (resolvedSubType === 'freemail') {
             document.getElementById('edit-fm-base-url').value = service.config?.base_url || '';
             document.getElementById('edit-fm-admin-token').value = '';
@@ -815,10 +854,18 @@ async function handleEditCustom(e) {
         };
         const apiKey = formData.get('api_key');
         if (apiKey && apiKey.trim()) config.api_key = apiKey.trim();
-    } else if (subType === 'yydsmail') {
+    } else if (subType === 'tempmail_builtin') {
+        config = {
+            base_url: formData.get('tpo_base_url'),
+            timeout: parseInt(formData.get('tpo_timeout'), 10) || 30,
+            max_retries: parseInt(formData.get('tpo_max_retries'), 10) || 3
+        };
+    } else if (subType === 'yyds_mail') {
         config = {
             base_url: formData.get('yyds_base_url'),
-            default_domain: formData.get('yyds_domain')
+            default_domain: formData.get('yyds_default_domain'),
+            timeout: parseInt(formData.get('yyds_timeout'), 10) || 30,
+            max_retries: parseInt(formData.get('yyds_max_retries'), 10) || 3
         };
         const apiKey = formData.get('yyds_api_key');
         if (apiKey && apiKey.trim()) config.api_key = apiKey.trim();
@@ -839,6 +886,15 @@ async function handleEditCustom(e) {
             password_length: parseInt(formData.get('dm_password_length'), 10) || 12
         };
         const apiKey = formData.get('dm_api_key');
+        if (apiKey && apiKey.trim()) config.api_key = apiKey.trim();
+    } else if (subType === 'luckmail') {
+        config = {
+            base_url: formData.get('lm_base_url'),
+            project_code: formData.get('lm_project_code') || 'openai',
+            email_type: formData.get('lm_email_type') || 'ms_graph',
+            preferred_domain: formData.get('lm_preferred_domain')
+        };
+        const apiKey = formData.get('lm_api_key');
         if (apiKey && apiKey.trim()) config.api_key = apiKey.trim();
     } else if (subType === 'freemail') {
         config = {

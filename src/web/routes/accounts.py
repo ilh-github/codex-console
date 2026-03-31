@@ -6,6 +6,7 @@ import asyncio
 import json
 import logging
 import re
+import threading
 import zipfile
 import base64
 from datetime import datetime, timedelta, timezone
@@ -14,22 +15,25 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, HTTPException, Query, BackgroundTasks, Body
 from fastapi.responses import StreamingResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy import func
 
 from ...config.constants import AccountStatus
 from ...config.settings import get_settings
-from ...core.openai.overview import fetch_codex_overview
+from ...core.openai.overview import fetch_codex_overview, AccountDeactivatedError
 from ...core.openai.token_refresh import refresh_account_token as do_refresh
 from ...core.openai.token_refresh import validate_account_token as do_validate
 from ...core.upload.cpa_upload import generate_token_json, batch_upload_to_cpa, upload_to_cpa
 from ...core.upload.team_manager_upload import upload_to_team_manager, batch_upload_to_team_manager
 from ...core.upload.sub2api_upload import batch_upload_to_sub2api, upload_to_sub2api
+from ...core.upload.new_api_upload import batch_upload_to_new_api, upload_to_new_api
 
 from ...core.dynamic_proxy import get_proxy_url_for_task
+from ...core.timezone_utils import utcnow_naive
 from ...database import crud
 from ...database.models import Account
 from ...database.session import get_db
+from ..task_manager import task_manager
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -44,6 +48,30 @@ INVALID_ACCOUNT_STATUSES = (
     AccountStatus.EXPIRED.value,
     AccountStatus.BANNED.value,
 )
+
+_QUICK_REFRESH_WORKFLOW_LOCK = threading.Lock()
+
+
+def _is_retryable_validate_error(error_message: Optional[str]) -> bool:
+    text = str(error_message or "").strip().lower()
+    if not text:
+        return False
+    retry_markers = (
+        "network_error",
+        "network",
+        "timeout",
+        "timed out",
+        "connection",
+        "temporarily",
+        "too many requests",
+        "http 429",
+        "http 500",
+        "http 502",
+        "http 503",
+        "http 504",
+        "rate limit",
+    )
+    return any(marker in text for marker in retry_markers)
 
 
 def _get_proxy(request_proxy: Optional[str] = None) -> Optional[str]:
@@ -74,6 +102,34 @@ def _apply_status_filter(query, status: Optional[str]):
     return query.filter(Account.status == normalized)
 
 
+def _get_quick_refresh_candidate_ids() -> List[int]:
+    with get_db() as db:
+        query = (
+            db.query(Account.id)
+            .filter(func.length(func.trim(func.coalesce(Account.access_token, ""))) > 0)
+            .filter(~Account.status.in_((AccountStatus.FAILED.value, AccountStatus.BANNED.value)))
+            .order_by(Account.id.asc())
+        )
+        return [int(row[0]) for row in query.all()]
+
+
+def has_active_batch_operations() -> bool:
+    if _QUICK_REFRESH_WORKFLOW_LOCK.locked():
+        return True
+
+    busy_statuses = {"pending", "running", "paused"}
+    for domain in ("accounts", "payment"):
+        try:
+            tasks = task_manager.list_domain_tasks(domain=domain, limit=50)
+        except Exception:
+            continue
+        for task in tasks:
+            status = str(task.get("status") or "").strip().lower()
+            if status in busy_statuses:
+                return True
+    return False
+
+
 # ============== Pydantic Models ==============
 
 class AccountResponse(BaseModel):
@@ -99,8 +155,7 @@ class AccountResponse(BaseModel):
     created_at: Optional[str] = None
     updated_at: Optional[str] = None
 
-    class Config:
-        from_attributes = True
+    model_config = ConfigDict(from_attributes=True)
 
 
 class AccountListResponse(BaseModel):
@@ -587,7 +642,7 @@ def _get_account_overview_data(
             # 避免把本地已确认的付费订阅（plus/team）被远端偶发 free/basic 覆盖降级。
             if detected_sub and current_sub != detected_sub:
                 account.subscription_type = detected_sub
-                account.subscription_at = datetime.utcnow() if detected_sub else None
+                account.subscription_at = utcnow_naive() if detected_sub else None
                 updated = True
             elif not detected_sub and current_sub in PAID_SUBSCRIPTION_TYPES:
                 logger.info(
@@ -603,6 +658,17 @@ def _get_account_overview_data(
         account.extra_data = merged_extra
         updated = True
         return overview, updated
+    except AccountDeactivatedError as exc:
+        logger.warning("账号被停用: email=%s err=%s", account.email, exc)
+        account.status = AccountStatus.BANNED.value
+        merged_extra = dict(extra_data)
+        merged_extra[OVERVIEW_EXTRA_DATA_KEY] = _fallback_overview(
+            account, error_message="account_deactivated", stale=True
+        )
+        merged_extra["account_deactivated_at"] = datetime.now(timezone.utc).isoformat()
+        account.extra_data = merged_extra
+        updated = True
+        return merged_extra[OVERVIEW_EXTRA_DATA_KEY], updated
     except Exception as exc:
         logger.warning(f"刷新账号[{account.email}]总览失败: {exc}")
         if cached:
@@ -660,7 +726,7 @@ async def create_manual_account(request: ManualAccountCreateRequest):
             )
             if subscription_type:
                 account.subscription_type = subscription_type
-                account.subscription_at = datetime.utcnow()
+                account.subscription_at = utcnow_naive()
                 db.commit()
                 db.refresh(account)
         except Exception as exc:
@@ -821,14 +887,14 @@ async def import_accounts(request: ImportAccountsRequest):
                         "proxy_used": _safe_text(item.proxy_used),
                         "source": source,
                         "extra_data": metadata,
-                        "last_refresh": datetime.utcnow(),
+                        "last_refresh": utcnow_naive(),
                     }
                     clean_update_payload = {k: v for k, v in update_payload.items() if v is not None}
                     account = crud.update_account(db, exists.id, **clean_update_payload)
                     if account is None:
                         raise RuntimeError("更新账号失败")
                     account.subscription_type = subscription_type
-                    account.subscription_at = datetime.utcnow() if subscription_type else None
+                    account.subscription_at = utcnow_naive() if subscription_type else None
                     db.commit()
                     result["updated"] += 1
                     continue
@@ -853,7 +919,7 @@ async def import_accounts(request: ImportAccountsRequest):
                 )
                 if subscription_type:
                     account.subscription_type = subscription_type
-                    account.subscription_at = datetime.utcnow()
+                    account.subscription_at = utcnow_naive()
                     db.commit()
                 result["created"] += 1
             except Exception as exc:
@@ -1341,7 +1407,7 @@ async def get_account_tokens(account_id: int):
         # 若 DB 为空但 cookies 可解析到 session_token，自动回写，避免后续重复解析。
         if resolved_session_token and not str(account.session_token or "").strip():
             account.session_token = resolved_session_token
-            account.last_refresh = datetime.utcnow()
+            account.last_refresh = utcnow_naive()
             db.commit()
             db.refresh(account)
 
@@ -1384,7 +1450,7 @@ async def update_account(account_id: int, request: AccountUpdateRequest):
         if request.session_token is not None:
             # 留空则清空，非空则更新
             update_data["session_token"] = request.session_token or None
-            update_data["last_refresh"] = datetime.utcnow()
+            update_data["last_refresh"] = utcnow_naive()
 
         account = crud.update_account(db, account_id, **update_data)
         return account_to_response(account)
@@ -1922,9 +1988,8 @@ async def refresh_account_token(account_id: int, request: Optional[TokenRefreshR
         }
 
 
-@router.post("/batch-validate")
-async def batch_validate_tokens(request: BatchValidateRequest):
-    """批量验证账号 Token 有效性"""
+def _run_batch_validate_tokens(request: BatchValidateRequest) -> Dict[str, Any]:
+    """Run token validation synchronously so it can be reused by schedulers."""
     proxy = _get_proxy(request.proxy)
 
     results = {
@@ -1968,6 +2033,76 @@ async def batch_validate_tokens(request: BatchValidateRequest):
             })
 
     return results
+
+
+@router.post("/batch-validate")
+async def batch_validate_tokens(request: BatchValidateRequest):
+    """批量验证账号 Token 有效性"""
+    return _run_batch_validate_tokens(request)
+
+
+def run_quick_refresh_workflow(source: str = "manual") -> Dict[str, Any]:
+    if not _QUICK_REFRESH_WORKFLOW_LOCK.acquire(blocking=False):
+        raise RuntimeError("quick_refresh_workflow_busy")
+
+    started_at = utcnow_naive()
+    try:
+        candidate_ids = _get_quick_refresh_candidate_ids()
+        proxy = _get_proxy()
+
+        validate_summary: Dict[str, Any] = {
+            "total": len(candidate_ids),
+            "valid_count": 0,
+            "invalid_count": 0,
+            "details": [],
+        }
+        subscription_summary: Dict[str, Any] = {
+            "total": 0,
+            "success_count": 0,
+            "failed_count": 0,
+            "details": [],
+        }
+
+        if candidate_ids:
+            validate_result = _run_batch_validate_tokens(
+                BatchValidateRequest(ids=candidate_ids, proxy=proxy, select_all=False)
+            )
+            validate_summary.update(validate_result or {})
+            validate_summary["total"] = len(candidate_ids)
+
+            valid_ids = [
+                int(detail.get("id"))
+                for detail in (validate_result or {}).get("details", [])
+                if detail.get("valid") and detail.get("id") is not None
+            ]
+
+            if valid_ids:
+                from . import payment as payment_routes
+
+                subscription_result = payment_routes.batch_check_subscription(
+                    payment_routes.BatchCheckSubscriptionRequest(
+                        ids=valid_ids,
+                        proxy=proxy,
+                        select_all=False,
+                    )
+                )
+                subscription_summary.update(subscription_result or {})
+                subscription_summary["total"] = len(valid_ids)
+
+        finished_at = utcnow_naive()
+        duration_ms = max(0, int((finished_at - started_at).total_seconds() * 1000))
+        return {
+            "source": str(source or "manual"),
+            "started_at": started_at.isoformat(),
+            "finished_at": finished_at.isoformat(),
+            "duration_ms": duration_ms,
+            "candidate_count": len(candidate_ids),
+            "proxy_used": proxy,
+            "validate": validate_summary,
+            "subscription": subscription_summary,
+        }
+    finally:
+        _QUICK_REFRESH_WORKFLOW_LOCK.release()
 
 
 @router.post("/{account_id}/validate")
@@ -2066,7 +2201,7 @@ async def upload_account_to_cpa(account_id: int, request: Optional[CPAUploadRequ
 
         if success:
             account.cpa_uploaded = True
-            account.cpa_uploaded_at = datetime.utcnow()
+            account.cpa_uploaded_at = utcnow_naive()
             db.commit()
             return {"success": True, "message": message}
         else:
@@ -2126,7 +2261,6 @@ async def batch_upload_accounts_to_sub2api(request: BatchSub2ApiUploadRequest):
         ids, api_url, api_key,
         concurrency=request.concurrency,
         priority=request.priority,
-        target_type=locals().get("target_type", "sub2api"),
     )
     return results
 
@@ -2168,12 +2302,83 @@ async def upload_account_to_sub2api(account_id: int, request: Optional[Sub2ApiUp
         success, message = upload_to_sub2api(
             [account], api_url, api_key,
             concurrency=concurrency, priority=priority,
-            target_type=locals().get("target_type", "sub2api")
+            target_type="sub2api"
         )
         if success:
             return {"success": True, "message": message}
         else:
             return {"success": False, "error": message}
+
+
+class NewApiUploadRequest(BaseModel):
+    """单账号 new-api 上传请求"""
+    service_id: Optional[int] = None
+
+
+class BatchNewApiUploadRequest(BaseModel):
+    """批量 new-api 上传请求"""
+    ids: List[int] = []
+    select_all: bool = False
+    status_filter: Optional[str] = None
+    email_service_filter: Optional[str] = None
+    search_filter: Optional[str] = None
+    service_id: Optional[int] = None
+
+
+@router.post("/batch-upload-new-api")
+async def batch_upload_accounts_to_new_api(request: BatchNewApiUploadRequest):
+    """批量上传账号到 new-api。"""
+    with get_db() as db:
+        if request.service_id:
+            service = crud.get_new_api_service_by_id(db, request.service_id)
+        else:
+            services = crud.get_new_api_services(db, enabled=True)
+            service = services[0] if services else None
+
+        if not service:
+            raise HTTPException(status_code=400, detail="未找到可用的 new-api 服务，请先在设置中配置")
+
+        ids = resolve_account_ids(
+            db, request.ids, request.select_all,
+            request.status_filter, request.email_service_filter, request.search_filter
+        )
+
+    return batch_upload_to_new_api(
+        ids,
+        service.api_url,
+        getattr(service, 'username', None),
+        getattr(service, 'password', None),
+    )
+
+
+@router.post("/{account_id}/upload-new-api")
+async def upload_account_to_new_api(account_id: int, request: Optional[NewApiUploadRequest] = Body(default=None)):
+    """上传单个账号到 new-api。"""
+    service_id = request.service_id if request else None
+
+    with get_db() as db:
+        if service_id:
+            service = crud.get_new_api_service_by_id(db, service_id)
+        else:
+            services = crud.get_new_api_services(db, enabled=True)
+            service = services[0] if services else None
+
+        if not service:
+            raise HTTPException(status_code=400, detail="未找到可用的 new-api 服务，请先在设置中配置")
+
+        account = crud.get_account_by_id(db, account_id)
+        if not account:
+            raise HTTPException(status_code=404, detail="账号不存在")
+        if not account.access_token:
+            return {"success": False, "error": "账号缺少 Token，无法上传"}
+
+        success, message = upload_to_new_api(
+            [account],
+            service.api_url,
+            getattr(service, 'username', None),
+            getattr(service, 'password', None),
+        )
+        return {"success": success, "message": message if success else None, "error": None if success else message}
 
 
 # ============== Team Manager 上传 ==============
@@ -2207,7 +2412,6 @@ async def batch_upload_accounts_to_tm(request: BatchUploadTMRequest):
 
         api_url = svc.api_url
         api_key = svc.api_key
-        target_type = getattr(svc, "target_type", "sub2api")
 
         ids = resolve_account_ids(
             db, request.ids, request.select_all,
@@ -2236,7 +2440,6 @@ async def upload_account_to_tm(account_id: int, request: Optional[UploadTMReques
 
         api_url = svc.api_url
         api_key = svc.api_key
-        target_type = getattr(svc, "target_type", "sub2api")
 
         account = crud.get_account_by_id(db, account_id)
         if not account:
@@ -2301,6 +2504,7 @@ def _build_inbox_config(db, service_type, email: str) -> dict:
         EST.FREEMAIL: "freemail",
         EST.IMAP_MAIL: "imap_mail",
         EST.OUTLOOK: "outlook",
+        EST.LUCKMAIL: "luckmail",
     }
     db_type = type_map.get(service_type)
     if not db_type:

@@ -38,6 +38,11 @@ def now_shanghai() -> datetime:
     return datetime.now(UTC).astimezone(SHANGHAI_TZ)
 
 
+def utcnow_naive() -> datetime:
+    """Return a naive UTC datetime for legacy ORM fields."""
+    return datetime.now(UTC).replace(tzinfo=None)
+
+
 def to_utc(dt: datetime | None) -> datetime | None:
     if dt is None:
         return None
@@ -58,4 +63,3 @@ def to_shanghai(dt: datetime | None) -> datetime | None:
 def to_shanghai_iso(dt: datetime | None) -> str | None:
     local_dt = to_shanghai(dt)
     return local_dt.isoformat() if local_dt else None
-

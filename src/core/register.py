@@ -18,6 +18,7 @@ from datetime import datetime
 
 from curl_cffi import requests as cffi_requests
 
+from .anyauto.register_flow import AnyAutoRegistrationEngine
 from .openai.oauth import OAuthManager, OAuthStart
 from .http_client import OpenAIHTTPClient, HTTPClientError, RequestConfig
 from ..services import EmailServiceFactory, BaseEmailService, EmailServiceType
@@ -29,6 +30,7 @@ from ..config.constants import (
     generate_random_user_info,
     OTP_CODE_PATTERN,
     DEFAULT_PASSWORD_LENGTH,
+    PASSWORD_SPECIAL_CHARSET,
     PASSWORD_CHARSET,
     AccountStatus,
     TaskStatus,
@@ -476,7 +478,16 @@ class RegistrationEngine:
 
     def _generate_password(self, length: int = DEFAULT_PASSWORD_LENGTH) -> str:
         """生成随机密码"""
-        return ''.join(secrets.choice(PASSWORD_CHARSET) for _ in range(length))
+        length = max(8, int(length or DEFAULT_PASSWORD_LENGTH))
+        password_chars = [
+            secrets.choice(string.ascii_lowercase),
+            secrets.choice(string.ascii_uppercase),
+            secrets.choice(string.digits),
+            secrets.choice(PASSWORD_SPECIAL_CHARSET),
+        ]
+        password_chars.extend(secrets.choice(PASSWORD_CHARSET) for _ in range(length - len(password_chars)))
+        secrets.SystemRandom().shuffle(password_chars)
+        return ''.join(password_chars)
 
     def _check_ip_location(self) -> Tuple[bool, Optional[str]]:
         """检查 IP 地理位置"""
@@ -3319,6 +3330,39 @@ class RegistrationEngine:
             self._last_register_password_error = str(e)
             return False, None
 
+    def _register_password_with_retry(
+        self,
+        did: Optional[str] = None,
+        sen_token: Optional[str] = None,
+    ) -> Tuple[bool, Optional[str]]:
+        """Retry password registration when OpenAI returns a generic recoverable 400."""
+        max_attempts = 3
+        retryable_markers = (
+            "failed to create account",
+            "create account",
+            "invalid_request_error",
+            "http 400",
+        )
+
+        for attempt in range(1, max_attempts + 1):
+            success, password = self._register_password(did, sen_token)
+            if success:
+                return True, password
+
+            error_text = str(self._last_register_password_error or "").strip().lower()
+            if attempt >= max_attempts:
+                break
+            if not any(marker in error_text for marker in retryable_markers):
+                break
+
+            self._log(
+                f"密码注册命中可重试 400，准备重新生成密码后重试 ({attempt}/{max_attempts})...",
+                "warning",
+            )
+            time.sleep(min(2 * attempt, 4))
+
+        return False, None
+
     def _mark_email_as_registered(self):
         """标记邮箱为已注册状态（用于防止重复尝试）"""
         try:
@@ -4308,7 +4352,7 @@ class RegistrationEngine:
             self._log(f"处理 OAuth 回调失败: {e}", "error")
             return None
 
-    def run(self) -> RegistrationResult:
+    def _run_primary_registration(self) -> RegistrationResult:
         """
         执行完整的注册流程
 
@@ -4384,7 +4428,7 @@ class RegistrationEngine:
                 self._log("检测到这是老朋友账号，直接切去登录拿 token，不走弯路")
             else:
                 self._log("5. 设置密码，别让小偷偷笑...")
-                password_ok, _ = self._register_password(did, sen_token)
+                password_ok, _ = self._register_password_with_retry(did, sen_token)
                 if not password_ok:
                     result.error_message = self._last_register_password_error or "注册密码失败"
                     return result
@@ -4482,7 +4526,171 @@ class RegistrationEngine:
             result.error_message = str(e)
             return result
 
-    def save_to_database(self, result: RegistrationResult) -> bool:
+    def _build_anyauto_fallback_result(
+        self,
+        flow_result: Optional[Dict[str, Any]],
+        primary_error: str = "",
+    ) -> RegistrationResult:
+        """Map PR60 AnyAuto V2 output into the current RegistrationResult structure."""
+        result = RegistrationResult(success=False, logs=self.logs)
+        result.email = str(self.email or "")
+        result.password = str(self.password or "")
+        result.device_id = str(self.device_id or "")
+
+        if not flow_result or not flow_result.get("success"):
+            fallback_error = str((flow_result or {}).get("error_message") or "注册失败").strip()
+            if primary_error and fallback_error and fallback_error != primary_error:
+                result.error_message = f"{primary_error} | anyauto fallback: {fallback_error}"
+            else:
+                result.error_message = fallback_error or primary_error or "注册失败"
+            result.metadata = {
+                "registration_flow": "any-auto-register-fallback",
+                "fallback_attempted": True,
+                "primary_error": primary_error,
+                "fallback_success": False,
+            }
+            return result
+
+        result.success = True
+        result.access_token = str(flow_result.get("access_token") or "")
+        result.refresh_token = str(flow_result.get("refresh_token") or "")
+        result.id_token = str(flow_result.get("id_token") or "")
+        result.session_token = str(flow_result.get("session_token") or "")
+        result.account_id = str(flow_result.get("account_id") or "")
+        result.workspace_id = str(flow_result.get("workspace_id") or "")
+        result.source = "register"
+
+        if not result.account_id:
+            token_payload = result.access_token or result.id_token
+            result.account_id = str(self._extract_account_id_from_access_token(token_payload) or "").strip()
+        if (not result.account_id) and result.id_token:
+            try:
+                account_info = self.oauth_manager.extract_account_info(result.id_token)
+                result.account_id = str(account_info.get("account_id") or "").strip()
+            except Exception:
+                pass
+
+        settings = get_settings()
+        client_id = str(
+            getattr(settings, "openai_client_id", "")
+            or getattr(self.oauth_manager, "client_id", "")
+            or ""
+        ).strip()
+        metadata = dict(flow_result.get("metadata") or {})
+        metadata.update(
+            {
+                "email_service": self.email_service.service_type.value,
+                "proxy_used": self.proxy_url,
+                "registered_at": datetime.now().isoformat(),
+                "registration_flow": "any-auto-register-fallback",
+                "fallback_attempted": True,
+                "primary_error": primary_error,
+                "client_id": client_id,
+                "device_id": result.device_id,
+                "has_session_token": bool(result.session_token),
+                "has_access_token": bool(result.access_token),
+                "has_refresh_token": bool(result.refresh_token),
+            }
+        )
+        result.metadata = metadata
+        return result
+
+    def _run_anyauto_fallback(self, primary_error: str = "") -> RegistrationResult:
+        """Run the PR60 AnyAuto V2 engine as a controlled fallback."""
+        settings = get_settings()
+        max_retries = int(getattr(settings, "registration_max_retries", 3) or 3)
+        browser_mode = str(
+            getattr(settings, "registration_anyauto_browser_mode", "protocol") or "protocol"
+        ).strip()
+
+        flow_engine = AnyAutoRegistrationEngine(
+            email_service=self.email_service,
+            proxy_url=self.proxy_url,
+            callback_logger=self._log,
+            max_retries=max_retries,
+            browser_mode=browser_mode or "protocol",
+            extra_config=None,
+        )
+        flow_result = flow_engine.run()
+
+        self.email_info = flow_engine.email_info
+        self.email = flow_engine.email
+        self.inbox_email = flow_engine.inbox_email
+        self.password = flow_engine.password
+        self.session = flow_engine.session
+        self.device_id = flow_engine.device_id
+
+        fallback_result = self._build_anyauto_fallback_result(flow_result, primary_error=primary_error)
+        if fallback_result.session_token:
+            self.session_token = fallback_result.session_token
+        return fallback_result
+
+    def _should_try_anyauto_fallback(self, result: RegistrationResult) -> bool:
+        settings = get_settings()
+        enabled = bool(getattr(settings, "registration_enable_anyauto_fallback", True))
+        if not enabled or result.success:
+            return False
+
+        error_text = str(result.error_message or "").strip().lower()
+        if not error_text:
+            return True
+
+        non_retryable_markers = (
+            "unsupported country",
+            "invalid email service",
+            "email service not found",
+        )
+        if any(marker in error_text for marker in non_retryable_markers):
+            return False
+
+        retryable_markers = (
+            "access_token",
+            "refresh_token",
+            "session",
+            "oauth",
+            "callback",
+            "authorization code",
+            "workspace",
+            "consent",
+            "otp",
+            "verification code",
+            "phone",
+            "add_phone",
+            "add-phone",
+            "sentinel",
+            "failed to create account",
+            "create account",
+            "invalid_request_error",
+            "http 400",
+            "registration failed",
+        )
+        return any(marker in error_text for marker in retryable_markers)
+
+    def run(self) -> RegistrationResult:
+        """Run the current primary flow first, then selectively fall back to PR60 AnyAuto V2."""
+        primary_result = self._run_primary_registration()
+        if primary_result.success:
+            return primary_result
+
+        if not self._should_try_anyauto_fallback(primary_result):
+            return primary_result
+
+        primary_error = str(primary_result.error_message or "").strip()
+        self._log("主注册链路未成功，开始尝试 PR60 anyauto V2 回退流程...", "warning")
+        fallback_result = self._run_anyauto_fallback(primary_error=primary_error)
+        if fallback_result.success:
+            self._log("PR60 anyauto V2 回退流程成功，已补上 V2 注册兜底能力")
+            return fallback_result
+
+        self._log(f"PR60 anyauto V2 回退流程也失败了: {fallback_result.error_message}", "warning")
+        return fallback_result
+
+    def save_to_database(
+        self,
+        result: RegistrationResult,
+        account_label: Optional[str] = None,
+        role_tag: Optional[str] = None,
+    ) -> bool:
         """
         保存注册结果到数据库
 
@@ -4517,7 +4725,9 @@ class RegistrationEngine:
                     id_token=result.id_token,
                     proxy_used=self.proxy_url,
                     extra_data=result.metadata,
-                    source=result.source
+                    source=result.source,
+                    account_label=account_label,
+                    role_tag=role_tag,
                 )
 
                 self._log(f"账户已存进数据库，落袋为安，ID: {account.id}")
