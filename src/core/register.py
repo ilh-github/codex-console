@@ -262,6 +262,9 @@ class RegistrationEngine:
         self._last_otp_validation_code: Optional[str] = None
         self._last_otp_validation_status_code: Optional[int] = None
         self._last_otp_validation_outcome: str = ""  # success/http_non_200/network_timeout/network_error
+        self._used_otp_codes: set[str] = set()  # 兜底：无邮件指纹时按 code 去重
+        self._used_otp_fingerprints: set[str] = set()  # 主去重：mail_ts|mail_id|code
+        self._last_fetched_otp_meta: Dict[str, Any] = {}
 
     def _log(self, message: str, level: str = "info"):
         """记录日志"""
@@ -1126,6 +1129,7 @@ class RegistrationEngine:
         这条链路用于 ChatGPT 网页会话，不复用 Codex OAuth 的 callback 状态。
         """
         if not session_obj or not self.email:
+            self._log("ChatGPT 网页直登: 会话或邮箱缺失，跳过密码优先链路", "warning")
             return False
 
         login_entry_url = "https://auth.openai.com/log-in-or-create-account"
@@ -1137,6 +1141,7 @@ class RegistrationEngine:
                 pass
             device_id = self._session_device_id_for_auth(session_obj)
         if not device_id:
+            self._log("ChatGPT 网页直登: 未拿到 oai-did，跳过密码优先链路", "warning")
             return False
 
         if not self._session_has_login_csrf_cookie(session_obj):
@@ -1145,92 +1150,85 @@ class RegistrationEngine:
             except Exception:
                 pass
         if not self._session_has_login_csrf_cookie(session_obj):
+            self._log("ChatGPT 网页直登: 缺少 login csrf cookie，跳过密码优先链路", "warning")
             return False
 
-        authorize_token = self._build_auth_sentinel_header_for_session(
-            session_obj,
-            "authorize_continue",
-            device_id,
-        )
-        if not authorize_token:
-            return False
+        authorize_response = None
+        max_authorize_attempts = 3
+        for attempt in range(1, max_authorize_attempts + 1):
+            authorize_token = self._build_auth_sentinel_header_for_session(
+                session_obj,
+                "authorize_continue",
+                device_id,
+            )
+            if not authorize_token:
+                self._log("ChatGPT 网页直登: authorize_continue sentinel 获取失败", "warning")
+                return False
 
-        authorize_response = session_obj.post(
-            OPENAI_API_ENDPOINTS["signup"],
-            headers={
-                "accept": "application/json",
-                "accept-language": "zh-CN,zh;q=0.9",
-                "content-type": "application/json",
-                "origin": "https://auth.openai.com",
-                "referer": "https://auth.openai.com/log-in",
-                "sec-fetch-dest": "empty",
-                "sec-fetch-mode": "cors",
-                "sec-fetch-site": "same-origin",
-                "openai-sentinel-token": authorize_token,
-            },
-            data=json.dumps(
-                {
-                    "username": {
-                        "kind": "email",
-                        "value": self.email,
-                    }
-                }
-            ),
-            timeout=20,
-        )
-        if authorize_response.status_code != 200:
-            return False
-
-        current_payload = authorize_response.json() or {}
-        page_type = str(((current_payload or {}).get("page") or {}).get("type") or "").strip()
-        otp_requested_at: Optional[float] = None
-
-        if page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
-            otp_response = session_obj.post(
-                "https://auth.openai.com/api/accounts/passwordless/send-otp",
+            authorize_response = session_obj.post(
+                OPENAI_API_ENDPOINTS["signup"],
                 headers={
                     "accept": "application/json",
                     "accept-language": "zh-CN,zh;q=0.9",
                     "content-type": "application/json",
                     "origin": "https://auth.openai.com",
-                    "referer": "https://auth.openai.com/log-in/password",
+                    "referer": "https://auth.openai.com/log-in",
                     "sec-fetch-dest": "empty",
                     "sec-fetch-mode": "cors",
                     "sec-fetch-site": "same-origin",
+                    "openai-sentinel-token": authorize_token,
                 },
+                data=json.dumps(
+                    {
+                        "username": {
+                            "kind": "email",
+                            "value": self.email,
+                        }
+                    }
+                ),
                 timeout=20,
             )
-            if otp_response.status_code == 200:
-                otp_requested_at = time.time() - 5
-                page_type = OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]
-            else:
-                password_token = self._build_auth_sentinel_header_for_session(
-                    session_obj,
-                    "password_verify",
-                    device_id,
+            if authorize_response.status_code != 429:
+                break
+            if attempt >= max_authorize_attempts:
+                break
+            backoff_seconds = 5 * attempt
+            self._log(
+                f"ChatGPT 网页直登: authorize/continue 命中限流 429（第 {attempt}/{max_authorize_attempts} 次），{backoff_seconds}s 后重试...",
+                "warning",
+            )
+            time.sleep(backoff_seconds)
+
+        if authorize_response is None or authorize_response.status_code != 200:
+            status_code = getattr(authorize_response, "status_code", "unknown")
+            self._log(f"ChatGPT 网页直登: authorize/continue 失败 HTTP {status_code}", "warning")
+            return False
+
+        current_payload = authorize_response.json() or {}
+        page_type = str(((current_payload or {}).get("page") or {}).get("type") or "").strip()
+        self._log(f"ChatGPT 网页直登: authorize/continue 返回页面 {page_type or 'unknown'}")
+        otp_requested_at: Optional[float] = None
+        entered_via_password = False
+
+        if page_type == OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]:
+            self._log("ChatGPT 网页直登: 命中密码页，先提交密码；若仍需邮箱验证码，再继续 OTP...", "warning")
+            password_result = self._submit_login_password()
+            if not password_result.success:
+                self._log(
+                    f"ChatGPT 网页直登: 提交密码失败: {password_result.error_message}",
+                    "warning",
                 )
-                if not password_token or not self.password:
-                    return False
-                password_response = session_obj.post(
-                    OPENAI_API_ENDPOINTS["password_verify"],
-                    headers={
-                        "accept": "application/json",
-                        "accept-language": "zh-CN,zh;q=0.9",
-                        "content-type": "application/json",
-                        "origin": "https://auth.openai.com",
-                        "referer": "https://auth.openai.com/log-in/password",
-                        "sec-fetch-dest": "empty",
-                        "sec-fetch-mode": "cors",
-                        "sec-fetch-site": "same-origin",
-                        "openai-sentinel-token": password_token,
-                    },
-                    data=json.dumps({"password": self.password}),
-                    timeout=20,
-                )
-                if password_response.status_code != 200:
-                    return False
-                current_payload = password_response.json() or {}
-                page_type = str(((current_payload or {}).get("page") or {}).get("type") or "").strip()
+                return False
+            page_type = str(password_result.page_type or "").strip()
+            entered_via_password = True
+            if page_type == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]:
+                otp_requested_at = self._otp_sent_at or (time.time() - 5)
+
+        if page_type == OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"] and not entered_via_password:
+            self._log("ChatGPT 网页直登: 已到邮箱验证码页，主动补发一次 OTP，锁定当前登录阶段的新邮件...", "warning")
+            if self._send_verification_code(referer="https://auth.openai.com/email-verification"):
+                self._prepare_expected_login_otp(grace_seconds=OTP_CREATED_AT_GRACE_SECONDS)
+                otp_requested_at = self._otp_sent_at
 
         payload, token = self._wait_for_chatgpt_web_session(session_obj, timeout=3)
         if token and payload.get("accessToken") and payload.get("user") and payload.get("account"):
@@ -1723,8 +1721,18 @@ class RegistrationEngine:
         if not current_url:
             return False
 
+        log_prefix_lower = str(log_prefix or "").strip().lower()
+        is_chatgpt_stage = ("chatgpt" in log_prefix_lower) or ("会话桥接" in log_prefix_lower)
+
         if "auth.openai.com/email-verification" in current_url:
-            self._log(f"{log_prefix}已直达邮箱验证码页，直接提交 OTP...")
+            self._log(
+                f"{log_prefix}已在邮箱验证码页，直接继续当前桥接页 OTP，避免 fresh login 额外触发 429/旧 state...",
+                "warning" if is_chatgpt_stage else "info",
+            )
+            if is_chatgpt_stage:
+                self._log(f"{log_prefix}先主动重发一次 OTP，确保当前 bridge 阶段拿到新验证码...", "warning")
+                self._send_verification_code(referer="https://auth.openai.com/email-verification")
+                self._prepare_expected_login_otp(grace_seconds=OTP_CREATED_AT_GRACE_SECONDS)
         elif "auth.openai.com/log-in/password" in current_url:
             self._log(f"{log_prefix}已直达密码页，先提交密码再继续...")
             password_result = self._submit_login_password()
@@ -1738,7 +1746,18 @@ class RegistrationEngine:
         else:
             return False
 
-        if not self._verify_email_otp_with_retry(stage_label=f"{log_prefix}验证码", max_attempts=2):
+        # ChatGPT/会话桥接阶段：放宽时间窗 + 缩短单轮取码等待，避免长时间卡住。
+        verify_fetch_timeout: Optional[int] = None
+        verify_max_attempts = 2
+        if is_chatgpt_stage:
+            verify_fetch_timeout = 45
+            verify_max_attempts = 3
+        if not self._verify_email_otp_with_retry(
+            stage_label=f"{log_prefix}验证码",
+            max_attempts=verify_max_attempts,
+            fetch_timeout=verify_fetch_timeout,
+            attempted_codes=set(self._used_otp_codes),
+        ):
             self._log(f"{log_prefix}验证码校验失败", "warning")
             return False
 
@@ -1937,10 +1956,11 @@ class RegistrationEngine:
         )
 
         try:
-            def _merge_temp_session_back() -> None:
+            def _merge_temp_session_back(source_session=None) -> None:
+                source_session = source_session or temp_session
                 merged_cookies = base_cookies
                 try:
-                    for name, value in list(temp_session.cookies.items()):
+                    for name, value in list(source_session.cookies.items()):
                         key = str(name or "").strip()
                         val = str(value or "").strip()
                         if not key or not val:
@@ -1952,14 +1972,15 @@ class RegistrationEngine:
                 if original_session:
                     self._seed_cookie_jar_from_text(original_session, merged_cookies)
 
-            def _accept_chatgpt_payload(payload: Any, token: str) -> bool:
+            def _accept_chatgpt_payload(payload: Any, token: str, *, session_obj=None) -> bool:
+                session_obj = session_obj or temp_session
                 usable = self._apply_chatgpt_session_hints(result, payload, session_token=token)
                 if token:
-                    _merge_temp_session_back()
+                    _merge_temp_session_back(session_obj)
                     self._log(f"ChatGPT 网页补会话成功，session_token 已补齐（len={len(token)}）")
                     return True
                 if allow_partial_success and usable:
-                    _merge_temp_session_back()
+                    _merge_temp_session_back(session_obj)
                     self._log("ChatGPT 网页补会话已建立可用登录上下文，继续恢复 Codex 授权...", "warning")
                     return True
                 return False
@@ -1980,21 +2001,34 @@ class RegistrationEngine:
                 return False
 
             final_url_lower = str(final_url or "").strip().lower()
+            bridge_stage_exhausted = False
             if "email-verification" in final_url_lower:
-                self._log("ChatGPT 网页补会话已直达邮箱验证码页，直接继续...", "warning")
-                self._otp_sent_at = time.time() - 5
-                if not self._verify_email_otp_with_retry(stage_label="ChatGPT 网页验证码", max_attempts=3):
-                    return False
-                continue_url = str(self._last_validate_otp_continue_url or "").strip()
-                if continue_url:
-                    self._visit_continue_url_for_session(continue_url, result=None)
-            else:
-                payload, token = self._wait_for_chatgpt_web_session(temp_session, timeout=5)
-                if _accept_chatgpt_payload(payload, token):
+                self._log(
+                    "ChatGPT 网页补会话命中邮箱验证码页，直接继续当前 bridge OTP，避免 fresh login 触发 429...",
+                    "warning",
+                )
+                if self._complete_chatgpt_bridge_stage(
+                    result,
+                    final_url=final_url,
+                    log_prefix="ChatGPT 网页补会话",
+                ):
+                    _merge_temp_session_back()
                     return True
+                bridge_stage_exhausted = True
+                self._log("ChatGPT 网页 bridge OTP 未建立可用会话，继续尝试 passwordless 直登链路...", "warning")
 
-                resume_start_url = str(final_url or auth_url or "").strip()
-                if resume_start_url:
+            payload, token = self._wait_for_chatgpt_web_session(temp_session, timeout=5)
+            if _accept_chatgpt_payload(payload, token):
+                return True
+
+            resume_start_url = str(final_url or auth_url or "").strip()
+            if resume_start_url:
+                if bridge_stage_exhausted and "email-verification" in str(resume_start_url).strip().lower():
+                    self._log(
+                        "ChatGPT 网页 bridge OTP 已失败一次，当前仍停在邮箱验证码页，跳过重复 bridge 重试，直接改走网页登录链路...",
+                        "warning",
+                    )
+                else:
                     self._log("ChatGPT 网页补会话未直达可用状态，尝试继续跑完 ChatGPT 授权回调链...", "warning")
                     callback_url, resumed_final_url = self._follow_chatgpt_auth_redirects(resume_start_url)
                     if callback_url and ("error=" not in callback_url):
@@ -2028,12 +2062,19 @@ class RegistrationEngine:
                     if _accept_chatgpt_payload(payload, token):
                         return True
 
-                self._log("ChatGPT 网页补会话未直达可用状态，改走 reference 风格的网页登录链路...", "warning")
-                if not self._perform_chatgpt_direct_auth_login(temp_session):
-                    return False
+            self._log("ChatGPT 网页补会话未直达可用状态，改走 reference 风格的网页登录链路...", "warning")
+            direct_session = cffi_requests.Session(
+                impersonate="chrome120",
+                proxy=self.proxy_url,
+            )
+            self._seed_cookie_jar_from_text(direct_session, base_cookies)
+            self.session = direct_session
+            self._log("ChatGPT 网页直登将使用全新会话，避免沿用 bridge 阶段的 OTP/max_attempts 状态...", "warning")
+            if not self._perform_chatgpt_direct_auth_login(direct_session):
+                return False
 
-            payload, token = self._wait_for_chatgpt_web_session(temp_session, timeout=12)
-            if not _accept_chatgpt_payload(payload, token):
+            payload, token = self._wait_for_chatgpt_web_session(direct_session, timeout=12)
+            if not _accept_chatgpt_payload(payload, token, session_obj=direct_session):
                 return False
             return True
         except Exception as e:
@@ -2305,7 +2346,16 @@ class RegistrationEngine:
                 )
                 return False
 
-            if not self._verify_email_otp_with_retry(stage_label="会话桥接登录验证码", max_attempts=3):
+            self._log("会话桥接自动登录先主动重发一次 OTP，确保拿到当前阶段的新邮件...", "warning")
+            self._send_verification_code(referer="https://auth.openai.com/email-verification")
+            self._prepare_expected_login_otp(grace_seconds=OTP_CREATED_AT_GRACE_SECONDS)
+
+            if not self._verify_email_otp_with_retry(
+                stage_label="会话桥接登录验证码",
+                max_attempts=3,
+                fetch_timeout=60,
+                attempted_codes=set(self._used_otp_codes),
+            ):
                 self._log("会话桥接自动登录验证码校验失败", "warning")
                 return False
 
@@ -2646,6 +2696,10 @@ class RegistrationEngine:
         if (not workspace_id) and (not continue_url):
             self._log("consent/workspace/select 未拿到可用结果，尝试 OAuth authorize 兜底", "warning")
 
+        if not continue_url and cached_continue:
+            continue_url = cached_continue
+            self._log("优先使用 create_account 缓存 continue_url 继续授权链路", "warning")
+
         if not continue_url:
             oauth_start_url = str(
                 (
@@ -2663,10 +2717,6 @@ class RegistrationEngine:
         if not continue_url and otp_continue:
             continue_url = otp_continue
             self._log("使用 OTP 返回 continue_url 继续授权链路", "warning")
-
-        if not continue_url and cached_continue:
-            continue_url = cached_continue
-            self._log("使用 create_account 缓存 continue_url 作为兜底", "warning")
 
         if not continue_url:
             result.error_message = "获取 continue_url 失败"
@@ -3031,7 +3081,7 @@ class RegistrationEngine:
             return False
 
     def _extract_account_id_from_access_token(self, access_token: str) -> str:
-        """从 access_token 的 JWT payload 尝试解析 chatgpt_account_id。"""
+        """从 access_token 的 JWT payload 尝试解析 chatgpt_account_id/account_id/workspace_id。"""
         try:
             raw = str(access_token or "").strip()
             if raw.count(".") < 2:
@@ -3044,12 +3094,13 @@ class RegistrationEngine:
             if not isinstance(claims, dict):
                 return ""
             auth_claims = claims.get("https://api.openai.com/auth") or {}
-            account_id = str(
-                auth_claims.get("chatgpt_account_id")
-                or claims.get("chatgpt_account_id")
-                or ""
-            ).strip()
-            return account_id
+            for key in ("chatgpt_account_id", "account_id", "workspace_id"):
+                value = str(auth_claims.get(key) or claims.get(key) or "").strip()
+                if len(value) >= 2 and value[0] == value[-1] == '"':
+                    value = value[1:-1].strip()
+                if value:
+                    return value
+            return ""
         except Exception:
             return ""
 
@@ -3067,6 +3118,11 @@ class RegistrationEngine:
                     pass
             if (not result.account_id) and result.access_token:
                 result.account_id = self._extract_account_id_from_access_token(result.access_token)
+
+            if (not result.account_id) and result.workspace_id:
+                result.account_id = str(result.workspace_id or "").strip()
+                if result.account_id:
+                    self._log(f"原生入口关键参数校验: Account ID 缺失，已回填 Workspace ID={result.account_id}", "warning")
 
             if not result.workspace_id:
                 result.workspace_id = str(self._get_workspace_id() or "").strip()
@@ -3335,6 +3391,7 @@ class RegistrationEngine:
         try:
             mailbox_email = str(self.inbox_email or self.email or "").strip()
             self._log(f"正在等待邮箱 {mailbox_email} 的验证码...")
+            self._last_fetched_otp_meta = {}
 
             email_id = self.email_info.get("service_id") if self.email_info else None
             fetch_timeout = int(timeout) if timeout and int(timeout) > 0 else 120
@@ -3345,6 +3402,9 @@ class RegistrationEngine:
                 pattern=OTP_CODE_PATTERN,
                 otp_sent_at=self._otp_sent_at,
             )
+            meta = getattr(self.email_service, "last_verification_meta", None)
+            if isinstance(meta, dict):
+                self._last_fetched_otp_meta = dict(meta)
 
             if code:
                 self._log(f"成功获取验证码: {code}")
@@ -3356,6 +3416,23 @@ class RegistrationEngine:
         except Exception as e:
             self._log(f"获取验证码失败: {e}", "error")
             return None
+
+    def _current_otp_fingerprint(self, code: str = "") -> str:
+        meta = self._last_fetched_otp_meta if isinstance(self._last_fetched_otp_meta, dict) else {}
+        normalized_code = str(code or "").strip()
+        meta_code = str(meta.get("code") or "").strip()
+        if normalized_code and meta_code and meta_code != normalized_code:
+            return ""
+
+        fingerprint = str(meta.get("fingerprint") or "").strip()
+        if fingerprint:
+            return fingerprint
+
+        mail_id = str(meta.get("mail_id") or "").strip()
+        mail_ts = meta.get("mail_ts")
+        if mail_id or (mail_ts is not None and str(mail_ts).strip()):
+            return f"{mail_ts if mail_ts is not None else '-'}|{mail_id or '-'}|{meta_code or normalized_code}"
+        return ""
 
     def _validate_verification_code(self, code: str) -> bool:
         """验证验证码"""
@@ -3378,7 +3455,20 @@ class RegistrationEngine:
             self._log(f"验证码校验状态: {response.status_code}")
             self._last_otp_validation_status_code = int(response.status_code)
             self._last_otp_validation_outcome = "success" if response.status_code == 200 else "http_non_200"
+            if response.status_code != 200:
+                try:
+                    detail_text = str(response.text or "").strip().replace("\n", " ")
+                except Exception:
+                    detail_text = ""
+                if detail_text:
+                    self._log(f"验证码校验失败详情: {detail_text[:220]}", "warning")
             if response.status_code == 200:
+                normalized_code = str(code or "").strip()
+                fingerprint = self._current_otp_fingerprint(normalized_code)
+                if fingerprint:
+                    self._used_otp_fingerprints.add(fingerprint)
+                elif normalized_code:
+                    self._used_otp_codes.add(normalized_code)
                 # 记录 OTP 校验返回中的 continue/workspace 提示，供 native 收尾兜底
                 try:
                     import urllib.parse as urlparse
@@ -3457,6 +3547,16 @@ class RegistrationEngine:
         self._last_validate_otp_workspace_id = None
         if attempted_codes is None:
             attempted_codes = set()
+        attempted_fingerprints: set[str] = set()
+        if self._used_otp_fingerprints:
+            attempted_fingerprints.update(fp for fp in self._used_otp_fingerprints if fp)
+        if self._used_otp_codes:
+            attempted_codes.update(code for code in self._used_otp_codes if code)
+        stage_lower = str(stage_label or "").strip().lower()
+        chatgpt_stage = ("chatgpt" in stage_lower) or ("会话补全" in stage_lower)
+        resend_triggered = False
+        resend_after_invalid_triggered = False
+        resend_after_duplicate_triggered = False
         for attempt in range(1, max_attempts + 1):
             code = (
                 self._get_verification_code(timeout=fetch_timeout)
@@ -3464,6 +3564,13 @@ class RegistrationEngine:
                 else self._get_verification_code()
             )
             if not code:
+                if chatgpt_stage:
+                    # 仅在 ChatGPT 补会话阶段主动重发一次，避免无限重发。
+                    if (not resend_triggered) and attempt < max_attempts:
+                        resend_triggered = True
+                        self._log(f"{stage_label}未取到验证码，尝试主动重发一次 OTP...", "warning")
+                        self._send_verification_code(referer="https://auth.openai.com/email-verification")
+                        self._prepare_expected_login_otp(grace_seconds=OTP_CREATED_AT_GRACE_SECONDS)
                 if attempt < max_attempts:
                     self._log(
                         f"{stage_label}第 {attempt}/{max_attempts} 次未取到验证码，稍后重试...",
@@ -3473,7 +3580,10 @@ class RegistrationEngine:
                     continue
                 return False
 
-            if code in attempted_codes:
+            fingerprint = self._current_otp_fingerprint(code)
+            duplicate_hit = fingerprint in attempted_fingerprints if fingerprint else code in attempted_codes
+
+            if duplicate_hit:
                 allow_same_code_retry = (
                     self._last_otp_validation_code == code
                     and self._last_otp_validation_outcome in {"network_timeout", "network_error"}
@@ -3491,6 +3601,15 @@ class RegistrationEngine:
                         continue
                     return False
 
+                if chatgpt_stage and (not resend_after_duplicate_triggered) and attempt < max_attempts:
+                    resend_after_duplicate_triggered = True
+                    self._log(
+                        f"{stage_label}第 {attempt}/{max_attempts} 次命中重复验证码 {code}，主动重发一次 OTP 等新邮件...",
+                        "warning",
+                    )
+                    self._send_verification_code(referer="https://auth.openai.com/email-verification")
+                    self._prepare_expected_login_otp(grace_seconds=OTP_CREATED_AT_GRACE_SECONDS)
+
                 if attempt < max_attempts:
                     self._log(
                         f"{stage_label}第 {attempt}/{max_attempts} 次命中重复验证码 {code}，等待新邮件...",
@@ -3500,10 +3619,28 @@ class RegistrationEngine:
                     continue
                 return False
 
-            attempted_codes.add(code)
+            if fingerprint:
+                attempted_fingerprints.add(fingerprint)
+            else:
+                attempted_codes.add(code)
 
             if self._validate_verification_code(code):
                 return True
+
+            if chatgpt_stage:
+                status_code = int(self._last_otp_validation_status_code or 0)
+                if (
+                    status_code in {400, 401, 409, 410, 422}
+                    and (not resend_after_invalid_triggered)
+                    and attempt < max_attempts
+                ):
+                    resend_after_invalid_triggered = True
+                    self._log(
+                        f"{stage_label}校验返回 {status_code}，主动重发一次 OTP 并等待新邮件...",
+                        "warning",
+                    )
+                    self._send_verification_code(referer="https://auth.openai.com/email-verification")
+                    self._prepare_expected_login_otp(grace_seconds=OTP_CREATED_AT_GRACE_SECONDS)
 
             if attempt < max_attempts:
                 self._log(
@@ -4300,6 +4437,11 @@ class RegistrationEngine:
                 elif effective_entry_flow != "native":
                     result.error_message = "未获取到 session_token（收尾补会话失败）"
                     return result
+
+            if (not result.account_id) and result.workspace_id:
+                result.account_id = str(result.workspace_id or "").strip()
+                if result.account_id:
+                    self._log(f"收尾阶段 Account ID 缺失，已回填 Workspace ID: {result.account_id}", "warning")
 
             # 10. 完成
             self._log("=" * 60)

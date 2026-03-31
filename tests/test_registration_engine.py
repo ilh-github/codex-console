@@ -5,7 +5,7 @@ import urllib.parse
 from src.config.constants import EmailServiceType, OPENAI_API_ENDPOINTS, OPENAI_PAGE_TYPES, generate_random_user_info
 from src.core.http_client import OpenAIHTTPClient
 from src.core.openai.oauth import OAuthStart
-from src.core.register import RegistrationEngine, RegistrationResult
+from src.core.register import RegistrationEngine, RegistrationResult, SignupFormResult
 from src.services.base import BaseEmailService
 
 
@@ -64,6 +64,7 @@ class FakeEmailService(BaseEmailService):
         super().__init__(EmailServiceType.TEMPMAIL)
         self.codes = list(codes)
         self.otp_requests = []
+        self.last_verification_meta = {}
 
     def create_email(self, config=None):
         return {
@@ -79,7 +80,14 @@ class FakeEmailService(BaseEmailService):
         })
         if not self.codes:
             raise AssertionError("no verification code queued")
-        return self.codes.pop(0)
+        next_item = self.codes.pop(0)
+        if isinstance(next_item, dict):
+            self.last_verification_meta = dict(next_item.get("meta") or {})
+            if next_item.get("code") and "code" not in self.last_verification_meta:
+                self.last_verification_meta["code"] = next_item.get("code")
+            return next_item.get("code")
+        self.last_verification_meta = {}
+        return next_item
 
     def list_emails(self, **kwargs):
         return []
@@ -539,6 +547,104 @@ def test_native_backup_does_not_resend_login_otp_after_failure(monkeypatch):
     assert result.error_message == "验证码校验失败"
 
 
+def test_verify_email_otp_with_retry_allows_same_code_from_new_mail_fingerprint(monkeypatch):
+    email_service = FakeEmailService([
+        {
+            "code": "111111",
+            "meta": {
+                "mail_id": "mail-1",
+                "mail_ts": 1,
+                "code": "111111",
+                "fingerprint": "1|mail-1|111111",
+            },
+        },
+        {
+            "code": "111111",
+            "meta": {
+                "mail_id": "mail-2",
+                "mail_ts": 2,
+                "code": "111111",
+                "fingerprint": "2|mail-2|111111",
+            },
+        },
+    ])
+    engine = RegistrationEngine(email_service)
+    validations = []
+
+    def fake_validate(code):
+        fingerprint = engine._current_otp_fingerprint(code)
+        validations.append((code, fingerprint))
+        engine._last_otp_validation_code = code
+        if len(validations) == 1:
+            engine._last_otp_validation_status_code = 401
+            engine._last_otp_validation_outcome = "http_non_200"
+            return False
+        engine._last_otp_validation_status_code = 200
+        engine._last_otp_validation_outcome = "success"
+        engine._used_otp_fingerprints.add(fingerprint)
+        return True
+
+    monkeypatch.setattr(engine, "_validate_verification_code", fake_validate)
+
+    ok = engine._verify_email_otp_with_retry(
+        stage_label="ChatGPT 网页补会话验证码",
+        max_attempts=2,
+        fetch_timeout=1,
+    )
+
+    assert ok is True
+    assert validations == [
+        ("111111", "1|mail-1|111111"),
+        ("111111", "2|mail-2|111111"),
+    ]
+
+
+def test_native_backup_prefers_cached_continue_url_before_oauth_authorize(monkeypatch):
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.session = QueueSession([])
+    engine.password = "pw-1"
+    engine.device_id = "did-1"
+    engine._create_account_continue_url = "https://auth.openai.com/sign-in-with-chatgpt/codex/consent?consent_challenge=from-create"
+    engine.oauth_start = OAuthStart(
+        auth_url="https://auth.example.test/authorize",
+        state="state-1",
+        code_verifier="verifier-1",
+        redirect_uri="http://localhost:1455/auth/callback",
+    )
+
+    monkeypatch.setattr(engine, "_complete_login_otp_once", lambda result, fetch_timeout=120: True)
+    monkeypatch.setattr(engine, "_visit_continue_url_for_session", lambda continue_url, result=None: continue_url)
+    monkeypatch.setattr(engine, "_get_workspace_id", lambda: "")
+    monkeypatch.setattr(engine, "_bootstrap_chatgpt_then_resume_codex", lambda result, label: False)
+    monkeypatch.setattr(engine, "_resume_oauth_context_from_authorize", lambda result, label: False)
+    monkeypatch.setattr(engine, "_select_workspace_for_current_session", lambda preferred_workspace_id="", referer_url=None: ("", ""))
+
+    followed = {}
+
+    def fake_follow_redirects(start_url):
+        followed["start_url"] = start_url
+        return ("http://localhost:1455/auth/callback?code=code-1&state=state-1", start_url)
+
+    monkeypatch.setattr(engine, "_follow_redirects", fake_follow_redirects)
+    monkeypatch.setattr(
+        engine,
+        "_handle_oauth_callback",
+        lambda callback_url: {
+            "account_id": "acct-1",
+            "access_token": "access-1",
+            "refresh_token": "refresh-1",
+            "id_token": "id-1",
+        },
+    )
+
+    result = RegistrationResult(success=False, logs=engine.logs)
+    ok = engine._complete_token_exchange_native_backup(result)
+
+    assert ok is True
+    assert followed["start_url"] == engine._create_account_continue_url
+
+
 def test_resume_oauth_context_from_authorize_can_continue_from_consent(monkeypatch):
     session = QueueSession([
         (
@@ -861,6 +967,174 @@ def test_bootstrap_chatgpt_web_session_direct_accepts_partial_logged_in_payload_
     assert result.access_token == "access-partial"
     assert result.account_id == "acct-partial"
     assert result.workspace_id == "ws-partial"
+
+
+def test_bootstrap_chatgpt_web_session_direct_skips_repeated_bridge_retry_after_email_verification_failure(monkeypatch):
+    class TempSession:
+        def __init__(self):
+            self.cookies = {}
+
+    temp_session = TempSession()
+    direct_session = TempSession()
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.email = "tester@example.com"
+    engine.password = "pw-1"
+
+    session_iter = iter([temp_session, direct_session])
+    monkeypatch.setattr("src.core.register.cffi_requests.Session", lambda *args, **kwargs: next(session_iter))
+    monkeypatch.setattr(
+        engine,
+        "_run_chatgpt_nextauth_bridge",
+        lambda session_obj, *, email, device_id, log_prefix: (
+            "https://auth.openai.com/email-verification",
+            "https://auth.openai.com/email-verification",
+        ),
+    )
+    monkeypatch.setattr(engine, "_complete_chatgpt_bridge_stage", lambda result, final_url, log_prefix: False)
+    monkeypatch.setattr(engine, "_wait_for_chatgpt_web_session", lambda session_obj, timeout=12: ({}, ""))
+    monkeypatch.setattr(
+        engine,
+        "_follow_chatgpt_auth_redirects",
+        lambda start_url: (_ for _ in ()).throw(AssertionError("unexpected repeated bridge redirect follow")),
+    )
+
+    direct_login_calls = []
+
+    def fake_direct_login(session_obj):
+        direct_login_calls.append(session_obj)
+        return True
+
+    monkeypatch.setattr(engine, "_perform_chatgpt_direct_auth_login", fake_direct_login)
+
+    result = RegistrationResult(success=False, logs=engine.logs)
+    ok = engine._bootstrap_chatgpt_web_session_direct(result)
+
+    assert ok is False
+    assert direct_login_calls == [direct_session]
+
+
+def test_perform_chatgpt_direct_auth_login_retries_authorize_continue_after_429(monkeypatch):
+    class DirectSession:
+        def __init__(self):
+            self.cookies = {}
+            self.post_calls = []
+            self.responses = [
+                DummyResponse(status_code=429, payload={}),
+                DummyResponse(payload={"page": {"type": OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"]}}),
+            ]
+
+        def post(self, url, **kwargs):
+            self.post_calls.append((url, kwargs))
+            if not self.responses:
+                raise AssertionError("unexpected post request")
+            return self.responses.pop(0)
+
+    session_obj = DirectSession()
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.email = "tester@example.com"
+    engine.session = session_obj
+
+    sleep_calls = []
+    send_calls = []
+    prepare_calls = []
+    monkeypatch.setattr(engine, "_session_device_id_for_auth", lambda session: "did-1")
+    monkeypatch.setattr(engine, "_session_has_login_csrf_cookie", lambda session: True)
+    monkeypatch.setattr(engine, "_build_auth_sentinel_header_for_session", lambda session, flow, did: "sentinel-1")
+    monkeypatch.setattr("src.core.register.time.sleep", lambda seconds: sleep_calls.append(seconds))
+    monkeypatch.setattr(
+        engine,
+        "_send_verification_code",
+        lambda referer=None: send_calls.append(referer) or True,
+    )
+    monkeypatch.setattr(
+        engine,
+        "_prepare_expected_login_otp",
+        lambda grace_seconds=None, **kwargs: prepare_calls.append(grace_seconds),
+    )
+    monkeypatch.setattr(engine, "_verify_email_otp_with_retry", lambda stage_label, max_attempts=3: True)
+    monkeypatch.setattr(engine, "_visit_continue_url_for_session", lambda continue_url, result=None: continue_url)
+    monkeypatch.setattr(
+        engine,
+        "_wait_for_chatgpt_web_session",
+        lambda session, timeout=12: (
+            {
+                "accessToken": "access-1",
+                "user": {"id": "user-1"},
+                "account": {"id": "acct-1"},
+            },
+            "session-1",
+        ),
+    )
+    engine._last_validate_otp_continue_url = "https://chatgpt.com/api/auth/callback/openai?code=cb-1&state=st-1"
+
+    ok = engine._perform_chatgpt_direct_auth_login(session_obj)
+
+    assert ok is True
+    assert len(session_obj.post_calls) == 2
+    assert sleep_calls == [5]
+    assert send_calls == ["https://auth.openai.com/email-verification"]
+    assert len(prepare_calls) == 1
+
+
+def test_perform_chatgpt_direct_auth_login_uses_password_when_authorize_lands_on_login_password(monkeypatch):
+    class DirectSession:
+        def __init__(self):
+            self.cookies = {}
+            self.post_calls = []
+            self.responses = [
+                DummyResponse(payload={"page": {"type": OPENAI_PAGE_TYPES["LOGIN_PASSWORD"]}}),
+            ]
+
+        def post(self, url, **kwargs):
+            self.post_calls.append((url, kwargs))
+            if not self.responses:
+                raise AssertionError("unexpected post request")
+            return self.responses.pop(0)
+
+    session_obj = DirectSession()
+    email_service = FakeEmailService([])
+    engine = RegistrationEngine(email_service)
+    engine.email = "tester@example.com"
+    engine.password = "pw-1"
+    engine.session = session_obj
+
+    password_calls = []
+    monkeypatch.setattr(engine, "_session_device_id_for_auth", lambda session: "did-1")
+    monkeypatch.setattr(engine, "_session_has_login_csrf_cookie", lambda session: True)
+    monkeypatch.setattr(engine, "_build_auth_sentinel_header_for_session", lambda session, flow, did: "sentinel-1")
+    monkeypatch.setattr(
+        engine,
+        "_submit_login_password",
+        lambda: password_calls.append(True) or SignupFormResult(
+            success=True,
+            page_type=OPENAI_PAGE_TYPES["EMAIL_OTP_VERIFICATION"],
+            is_existing_account=True,
+        ),
+    )
+    monkeypatch.setattr(engine, "_send_verification_code", lambda referer=None: (_ for _ in ()).throw(AssertionError("unexpected resend")))
+    monkeypatch.setattr(engine, "_verify_email_otp_with_retry", lambda stage_label, max_attempts=3: True)
+    monkeypatch.setattr(engine, "_visit_continue_url_for_session", lambda continue_url, result=None: continue_url)
+    monkeypatch.setattr(
+        engine,
+        "_wait_for_chatgpt_web_session",
+        lambda session, timeout=12: (
+            {
+                "accessToken": "access-1",
+                "user": {"id": "user-1"},
+                "account": {"id": "acct-1"},
+            },
+            "session-1",
+        ),
+    )
+    engine._otp_sent_at = 1234567890
+    engine._last_validate_otp_continue_url = "https://chatgpt.com/api/auth/callback/openai?code=cb-1&state=st-1"
+
+    ok = engine._perform_chatgpt_direct_auth_login(session_obj)
+
+    assert ok is True
+    assert password_calls == [True]
 
 
 def test_run_registers_then_relogs_to_fetch_token():

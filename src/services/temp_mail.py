@@ -73,6 +73,8 @@ class TempMailService(BaseEmailService):
         self._email_cache: Dict[str, Dict[str, Any]] = {}
         # 记录每个邮箱上一次成功使用的邮件 ID，避免重复使用旧验证码
         self._last_used_mail_ids: Dict[str, str] = {}
+        # 最近一次成功取码的邮件元信息，供上层做更精确的去重
+        self.last_verification_meta: Dict[str, Any] = {}
 
     def _decode_mime_header(self, value: str) -> str:
         """解码 MIME 头，兼容 RFC 2047 编码主题。"""
@@ -637,6 +639,7 @@ class TempMailService(BaseEmailService):
             验证码字符串，超时返回 None
         """
         logger.info(f"正在从 TempMail 邮箱 {email} 获取验证码...")
+        self.last_verification_meta = {}
 
         start_time = time.time()
         seen_mail_ids: set = set()
@@ -770,6 +773,15 @@ class TempMailService(BaseEmailService):
                         time.sleep(3)
                         continue
                     self._last_used_mail_ids[email] = str(best["mail_id"])
+                    mail_ts = best.get("mail_ts")
+                    mail_id = str(best.get("mail_id") or "").strip() or "-"
+                    fingerprint = f"{mail_ts if mail_ts is not None else '-'}|{mail_id}|{code}"
+                    self.last_verification_meta = {
+                        "mail_id": mail_id,
+                        "mail_ts": mail_ts,
+                        "code": code,
+                        "fingerprint": fingerprint,
+                    }
                     logger.info(
                         "从 TempMail 邮箱 %s 找到验证码: %s（mail_id=%s ts=%s semantic=%s）",
                         email,
@@ -787,6 +799,7 @@ class TempMailService(BaseEmailService):
             time.sleep(3)
 
         logger.warning(f"等待 TempMail 验证码超时: {email}")
+        self.last_verification_meta = {}
         return None
 
     def list_emails(self, limit: int = 100, offset: int = 0, **kwargs) -> List[Dict[str, Any]]:

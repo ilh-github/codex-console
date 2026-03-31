@@ -1682,6 +1682,11 @@ async def export_accounts_cpa(request: BatchExportRequest):
             request.status_filter, request.email_service_filter, request.search_filter
         )
         accounts = db.query(Account).filter(Account.id.in_(ids)).all()
+        logger.info(
+            "export/cpa start: requested=%s resolved=%s",
+            len(request.ids or []),
+            len(accounts),
+        )
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
@@ -1689,6 +1694,14 @@ async def export_accounts_cpa(request: BatchExportRequest):
             # 单个账号直接返回 JSON 文件
             acc = accounts[0]
             token_data = generate_token_json(acc)
+            logger.info(
+                "export/cpa single: db_id=%s email=%s account_id=%s has_id=%s has_refresh=%s",
+                acc.id,
+                acc.email,
+                str(token_data.get("account_id") or token_data.get("chatgpt_account_id") or "").strip() or "-",
+                bool(str(token_data.get("id_token") or "").strip()),
+                bool(str(token_data.get("refresh_token") or "").strip()),
+            )
             content = json.dumps(token_data, ensure_ascii=False, indent=2)
             filename = f"{acc.email}.json"
             return StreamingResponse(
@@ -1702,6 +1715,14 @@ async def export_accounts_cpa(request: BatchExportRequest):
         with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
             for acc in accounts:
                 token_data = generate_token_json(acc)
+                logger.info(
+                    "export/cpa zip-item: db_id=%s email=%s account_id=%s has_id=%s has_refresh=%s",
+                    acc.id,
+                    acc.email,
+                    str(token_data.get("account_id") or token_data.get("chatgpt_account_id") or "").strip() or "-",
+                    bool(str(token_data.get("id_token") or "").strip()),
+                    bool(str(token_data.get("refresh_token") or "").strip()),
+                )
                 content = json.dumps(token_data, ensure_ascii=False, indent=2)
                 zf.writestr(f"{acc.email}.json", content)
 

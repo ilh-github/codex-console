@@ -3,6 +3,8 @@
 """
 
 import asyncio
+import base64
+import json
 import logging
 import uuid
 import random
@@ -27,6 +29,25 @@ router = APIRouter()
 running_tasks: dict = {}
 # 批量任务存储
 batch_tasks: Dict[str, dict] = {}
+
+
+def _decode_jwt_payload_no_verify(token: str) -> dict:
+    text = str(token or "").strip()
+    if not text or "." not in text:
+        return {}
+    parts = text.split(".")
+    if len(parts) < 2:
+        return {}
+    payload_part = parts[1]
+    if not payload_part:
+        return {}
+    padding = "=" * (-len(payload_part) % 4)
+    try:
+        raw = base64.urlsafe_b64decode(payload_part + padding)
+        data = json.loads(raw.decode("utf-8"))
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
 
 
 # ============== Proxy Helper Functions ==============
@@ -450,6 +471,50 @@ def _run_sync_registration_task(task_uuid: str, email_service_type: str, proxy: 
                         saved_account = db.query(AccountModel).filter_by(email=result.email).first()
                         if saved_account and saved_account.access_token:
                             token_data = generate_token_json(saved_account)
+                            token_account_id = str(
+                                token_data.get("account_id")
+                                or token_data.get("chatgpt_account_id")
+                                or ""
+                            ).strip()
+                            if not token_account_id:
+                                token_account_id = str(
+                                    saved_account.account_id
+                                    or saved_account.workspace_id
+                                    or ""
+                                ).strip()
+                                if token_account_id:
+                                    token_data["account_id"] = token_account_id
+                            if token_account_id and not str(token_data.get("chatgpt_account_id") or "").strip():
+                                token_data["chatgpt_account_id"] = token_account_id
+
+                            if not token_account_id:
+                                access_claims = _decode_jwt_payload_no_verify(saved_account.access_token or "")
+                                auth_claims = access_claims.get("https://api.openai.com/auth")
+                                if isinstance(auth_claims, dict):
+                                    token_account_id = str(
+                                        auth_claims.get("chatgpt_account_id")
+                                        or auth_claims.get("account_id")
+                                        or auth_claims.get("workspace_id")
+                                        or ""
+                                    ).strip()
+                                    if token_account_id:
+                                        token_data["account_id"] = token_account_id
+                                        token_data["chatgpt_account_id"] = token_account_id
+
+                            token_snapshot = {
+                                "email": str(token_data.get("email") or "").strip(),
+                                "account_id": str(token_data.get("account_id") or "").strip(),
+                                "chatgpt_account_id": str(token_data.get("chatgpt_account_id") or "").strip(),
+                                "has_access_token": bool(str(token_data.get("access_token") or "").strip()),
+                                "has_id_token": bool(str(token_data.get("id_token") or "").strip()),
+                                "has_refresh_token": bool(str(token_data.get("refresh_token") or "").strip()),
+                                "db_account_id": str(saved_account.account_id or "").strip(),
+                                "db_workspace_id": str(saved_account.workspace_id or "").strip(),
+                            }
+                            log_callback(f"[CPA] Token 预检: {json.dumps(token_snapshot, ensure_ascii=False)}")
+                            if not token_snapshot["account_id"]:
+                                log_callback("[CPA][Warn] Token account_id 仍为空，后续额度拉取可能失败")
+
                             _cpa_ids = cpa_service_ids or []
                             if not _cpa_ids:
                                 # 未指定则取所有启用的服务

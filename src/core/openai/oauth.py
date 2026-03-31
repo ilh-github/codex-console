@@ -101,6 +101,46 @@ def _jwt_claims_no_verify(id_token: str) -> Dict[str, Any]:
         return {}
 
 
+def _extract_auth_claims(claims: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(claims, dict):
+        return {}
+    auth_claims = claims.get("https://api.openai.com/auth")
+    if isinstance(auth_claims, dict):
+        return auth_claims
+    auth_claims = claims.get("auth_data")
+    if isinstance(auth_claims, dict):
+        return auth_claims
+    return {}
+
+
+def _normalize_claim_text(value: Any) -> str:
+    text = str(value or "").strip()
+    if len(text) >= 2 and text[0] == text[-1] == '"':
+        text = text[1:-1].strip()
+    return text
+
+
+def _extract_account_id_from_claims(*claims_candidates: Dict[str, Any]) -> str:
+    keys = (
+        "chatgpt_account_id",
+        "account_id",
+        "workspace_id",
+    )
+    for claims in claims_candidates:
+        if not isinstance(claims, dict):
+            continue
+        auth_claims = _extract_auth_claims(claims)
+        for key in keys:
+            value = _normalize_claim_text(auth_claims.get(key))
+            if value:
+                return value
+        for key in keys:
+            value = _normalize_claim_text(claims.get(key))
+            if value:
+                return value
+    return ""
+
+
 def _decode_jwt_segment(seg: str) -> Dict[str, Any]:
     """解码 JWT 片段"""
     raw = (seg or "").strip()
@@ -286,10 +326,10 @@ def submit_callback_url(
     id_token = (token_resp.get("id_token") or "").strip()
     expires_in = _to_int(token_resp.get("expires_in"))
 
-    claims = _jwt_claims_no_verify(id_token)
-    email = str(claims.get("email") or "").strip()
-    auth_claims = claims.get("https://api.openai.com/auth") or {}
-    account_id = str(auth_claims.get("chatgpt_account_id") or "").strip()
+    id_claims = _jwt_claims_no_verify(id_token)
+    access_claims = _jwt_claims_no_verify(access_token)
+    email = str(id_claims.get("email") or access_claims.get("email") or "").strip()
+    account_id = _extract_account_id_from_claims(id_claims, access_claims)
 
     now = int(time.time())
     expired_rfc3339 = time.strftime(
@@ -358,13 +398,12 @@ class OAuthManager:
 
     def extract_account_info(self, id_token: str) -> Dict[str, Any]:
         """从 ID Token 中提取账户信息"""
-        claims = _jwt_claims_no_verify(id_token)
-        email = str(claims.get("email") or "").strip()
-        auth_claims = claims.get("https://api.openai.com/auth") or {}
-        account_id = str(auth_claims.get("chatgpt_account_id") or "").strip()
+        id_claims = _jwt_claims_no_verify(id_token)
+        email = str(id_claims.get("email") or "").strip()
+        account_id = _extract_account_id_from_claims(id_claims)
 
         return {
             "email": email,
             "account_id": account_id,
-            "claims": claims
+            "claims": id_claims
         }
