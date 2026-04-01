@@ -23,7 +23,7 @@ from ...database import crud
 from ...database.session import get_db
 from ...database.models import RegistrationTask, ScheduledRegistrationJob, Proxy
 from ...core.register import RegistrationEngine, RegistrationResult
-from ...services import EmailServiceFactory, EmailServiceType
+from ...services import EmailServiceFactory, EmailServiceType, is_luckmail_sdk_available
 from ...config.settings import get_settings, Settings
 from ...core.auto_registration import (
     add_auto_registration_log,
@@ -2034,25 +2034,26 @@ async def get_available_email_services():
         result["imap_mail"]["count"] = len(imap_mail_services)
         result["imap_mail"]["available"] = len(imap_mail_services) > 0
 
-        luckmail_services = db.query(EmailServiceModel).filter(
-            EmailServiceModel.service_type == "luckmail",
-            EmailServiceModel.enabled == True
-        ).order_by(EmailServiceModel.priority.asc()).all()
+        if is_luckmail_sdk_available():
+            luckmail_services = db.query(EmailServiceModel).filter(
+                EmailServiceModel.service_type == "luckmail",
+                EmailServiceModel.enabled == True
+            ).order_by(EmailServiceModel.priority.asc()).all()
 
-        for service in luckmail_services:
-            config = service.config or {}
-            result["luckmail"]["services"].append({
-                "id": service.id,
-                "name": service.name,
-                "type": "luckmail",
-                "project_code": config.get("project_code"),
-                "email_type": config.get("email_type"),
-                "preferred_domain": config.get("preferred_domain"),
-                "priority": service.priority
-            })
+            for service in luckmail_services:
+                config = service.config or {}
+                result["luckmail"]["services"].append({
+                    "id": service.id,
+                    "name": service.name,
+                    "type": "luckmail",
+                    "project_code": config.get("project_code"),
+                    "email_type": config.get("email_type"),
+                    "preferred_domain": config.get("preferred_domain"),
+                    "priority": service.priority
+                })
 
-        result["luckmail"]["count"] = len(luckmail_services)
-        result["luckmail"]["available"] = len(luckmail_services) > 0
+            result["luckmail"]["count"] = len(luckmail_services)
+            result["luckmail"]["available"] = len(luckmail_services) > 0
 
     return result
 

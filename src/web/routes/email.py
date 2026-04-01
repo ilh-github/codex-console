@@ -14,7 +14,7 @@ from ...database.session import get_db
 from ...database.models import EmailService as EmailServiceModel
 from ...database.models import Account as AccountModel
 from ...config.settings import get_settings
-from ...services import EmailServiceFactory, EmailServiceType
+from ...services import EmailServiceFactory, EmailServiceType, is_luckmail_sdk_available
 
 logger = logging.getLogger(__name__)
 router = APIRouter()
@@ -238,8 +238,7 @@ async def get_email_services_stats():
 @router.get("/types")
 async def get_service_types():
     """获取支持的邮箱服务类型"""
-    return {
-        "types": [
+    types = [
             {
                 "value": "tempmail",
                 "label": "Tempmail.lol",
@@ -362,9 +361,11 @@ async def get_service_types():
                     {"name": "preferred_domain", "label": "优先域名", "required": False, "placeholder": "outlook.com"},
                     {"name": "poll_interval", "label": "轮询间隔(秒)", "required": False, "default": 3.0},
                 ]
-            }
-        ]
-    }
+            },
+    ]
+    if not is_luckmail_sdk_available():
+        types = [item for item in types if item.get("value") != "luckmail"]
+    return {"types": types}
 
 
 @router.get("", response_model=EmailServiceListResponse)
@@ -429,6 +430,12 @@ async def create_email_service(request: EmailServiceCreate):
         EmailServiceType(request.service_type)
     except ValueError:
         raise HTTPException(status_code=400, detail=f"无效的服务类型: {request.service_type}")
+
+    if request.service_type == "luckmail" and not is_luckmail_sdk_available():
+        raise HTTPException(
+            status_code=400,
+            detail="当前环境未启用 LuckMail：缺少 luckmail SDK，请先安装或挂载后再添加该服务",
+        )
 
     with get_db() as db:
         # 检查名称是否重复
@@ -503,6 +510,12 @@ async def test_email_service(service_id: int):
         service = db.query(EmailServiceModel).filter(EmailServiceModel.id == service_id).first()
         if not service:
             raise HTTPException(status_code=404, detail="服务不存在")
+
+        if service.service_type == "luckmail" and not is_luckmail_sdk_available():
+            return ServiceTestResult(
+                success=False,
+                message="当前环境未启用 LuckMail：缺少 luckmail SDK",
+            )
 
         try:
             service_type = EmailServiceType(service.service_type)

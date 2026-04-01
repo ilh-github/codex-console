@@ -8,6 +8,7 @@ import re
 import sys
 import threading
 import time
+from functools import lru_cache
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set
@@ -22,6 +23,7 @@ _STATE_LOCK = threading.RLock()
 LUCKMAIL_APPEAL_ENABLED = False
 
 
+@lru_cache(maxsize=1)
 def _load_luckmail_client_class():
     """
     兼容两种来源：
@@ -52,6 +54,11 @@ def _load_luckmail_client_class():
         except Exception:
             continue
     return None
+
+
+def is_luckmail_sdk_available() -> bool:
+    """LuckMail SDK 是否可用。"""
+    return _load_luckmail_client_class() is not None
 
 
 class LuckMailService(BaseEmailService):

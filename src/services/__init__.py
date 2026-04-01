@@ -16,7 +16,7 @@ from .outlook import OutlookService
 from .moe_mail import MeoMailEmailService
 from .temp_mail import TempMailService
 from .duck_mail import DuckMailService
-from .luckmail_mail import LuckMailService
+from .luckmail_mail import LuckMailService, is_luckmail_sdk_available
 from .freemail import FreemailService
 from .imap_mail import ImapMailService
 from .cloudmail import CloudMailService
@@ -65,6 +65,7 @@ __all__ = [
     'TempMailService',
     'DuckMailService',
     'LuckMailService',
+    'is_luckmail_sdk_available',
     'FreemailService',
     'ImapMailService',
     'CloudMailService',

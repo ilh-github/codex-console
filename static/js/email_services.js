@@ -99,12 +99,29 @@ const CUSTOM_SUBTYPE_LABELS = {
 
 // 初始化
 document.addEventListener('DOMContentLoaded', () => {
+    loadServiceTypeCapabilities();
     loadStats();
     loadOutlookServices();
     loadCustomServices();
     loadTempmailConfig();
     initEventListeners();
 });
+
+async function loadServiceTypeCapabilities() {
+    try {
+        const data = await api.get('/email-services/types');
+        const supportedTypes = new Set((data.types || []).map(item => item.value));
+        if (!supportedTypes.has('luckmail')) {
+            const option = elements.customSubType?.querySelector('option[value="luckmail"]');
+            if (option) option.remove();
+            if (elements.customSubType?.value === 'luckmail') {
+                switchAddSubType('moemail');
+            }
+        }
+    } catch (error) {
+        console.warn('加载邮箱服务类型能力失败:', error);
+    }
+}
 
 // 事件监听
 function initEventListeners() {
