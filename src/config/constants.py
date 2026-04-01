@@ -3,7 +3,7 @@
 """
 
 import random
-from datetime import datetime
+from datetime import datetime, date, timedelta
 from enum import Enum
 from typing import Dict, List, Tuple
 
@@ -282,20 +282,26 @@ def generate_random_user_info() -> dict:
     # 注册阶段使用更像真人资料的姓名格式，降低单名触发风控的概率。
     name = f"{random.choice(FIRST_NAMES)} {random.choice(LAST_NAMES)}"
 
-    # 生成随机生日（18-45岁）
-    current_year = datetime.now().year
-    birth_year = random.randint(current_year - 45, current_year - 18)
-    birth_month = random.randint(1, 12)
-    # 根据月份确定天数
-    if birth_month in [1, 3, 5, 7, 8, 10, 12]:
-        birth_day = random.randint(1, 31)
-    elif birth_month in [4, 6, 9, 11]:
-        birth_day = random.randint(1, 30)
-    else:
-        # 2月，简化处理
-        birth_day = random.randint(1, 28)
+    # 生成随机生日（按“当天年龄”精确计算，避免出现未满 18 周岁的边界值）。
+    # 这里默认 21~45 岁，降低生日边界导致的注册风险。
+    min_age = 21
+    max_age = 45
 
-    birthdate = f"{birth_year}-{birth_month:02d}-{birth_day:02d}"
+    today = date.today()
+
+    def _years_ago(base: date, years: int) -> date:
+        try:
+            return base.replace(year=base.year - years)
+        except ValueError:
+            # 兼容 2/29
+            return base.replace(month=2, day=28, year=base.year - years)
+
+    latest_birth = _years_ago(today, min_age)   # 最年轻（也已满 min_age）
+    oldest_birth = _years_ago(today, max_age)   # 最年长
+    span_days = max((latest_birth - oldest_birth).days, 0)
+    random_offset = random.randint(0, span_days)
+    birth_day = oldest_birth + timedelta(days=random_offset)
+    birthdate = birth_day.strftime("%Y-%m-%d")
 
     return {
         "name": name,

@@ -1741,8 +1741,10 @@ class RegistrationEngine:
                 "warning" if is_chatgpt_stage else "info",
             )
             if is_chatgpt_stage:
-                self._log(f"{log_prefix}先主动重发一次 OTP，确保当前 bridge 阶段拿到新验证码...", "warning")
-                self._send_verification_code(referer="https://auth.openai.com/email-verification")
+                self._log(
+                    f"{log_prefix}优先等待当前阶段系统自动发送的 OTP，避免过早重发导致旧验证码混入...",
+                    "warning",
+                )
                 self._prepare_expected_login_otp(grace_seconds=OTP_CREATED_AT_GRACE_SECONDS)
         elif "auth.openai.com/log-in/password" in current_url:
             self._log(f"{log_prefix}已直达密码页，先提交密码再继续...")
@@ -2641,12 +2643,6 @@ class RegistrationEngine:
         原生入口对齐备份版收尾链路：
         登录验证码 -> Workspace -> redirect -> OAuth callback -> token 入袋。
         """
-        def _is_registration_gate_url(url: str) -> bool:
-            u = str(url or "").strip().lower()
-            if not u:
-                return False
-            return ("auth.openai.com/about-you" in u) or ("auth.openai.com/add-phone" in u)
-
         if not self._complete_login_otp_once(result, fetch_timeout=120):
             return False
 
@@ -2667,12 +2663,12 @@ class RegistrationEngine:
             result.workspace_id = workspace_id
 
         continue_url = ""
-        if otp_continue and _is_registration_gate_url(otp_continue):
+        if otp_continue and self._is_registration_gate_url(otp_continue):
             self._log("OTP 返回 continue_url 指向注册门页（about-you/add-phone），本轮收尾忽略该地址")
             otp_continue = ""
 
         cached_continue = str(self._create_account_continue_url or "").strip()
-        if cached_continue and _is_registration_gate_url(cached_continue):
+        if cached_continue and self._is_registration_gate_url(cached_continue):
             self._log("create_account 缓存 continue_url 指向注册门页（about-you/add-phone），本轮收尾忽略该地址")
             cached_continue = ""
 
@@ -3669,6 +3665,35 @@ class RegistrationEngine:
                 attempted_codes.add(code)
 
             if self._validate_verification_code(code):
+                if chatgpt_stage:
+                    continue_url = str(self._last_validate_otp_continue_url or "").strip()
+                    lowered_continue = continue_url.lower()
+
+                    # ChatGPT 补会话阶段命中注册门页通常是旧会话链路，不应视为成功。
+                    if self._is_registration_gate_url(continue_url):
+                        if (not resend_after_invalid_triggered) and attempt < max_attempts:
+                            resend_after_invalid_triggered = True
+                            self._log(
+                                f"{stage_label}命中注册门页 continue_url（about-you/add-phone），疑似旧会话验证码；主动重发一次 OTP...",
+                                "warning",
+                            )
+                            self._send_verification_code(referer="https://auth.openai.com/email-verification")
+                            self._prepare_expected_login_otp(grace_seconds=OTP_CREATED_AT_GRACE_SECONDS)
+
+                        if attempt < max_attempts:
+                            self._log(
+                                f"{stage_label}校验成功但 continue_url 仍指向注册门页，继续等待当前登录阶段新验证码...",
+                                "warning",
+                            )
+                            time.sleep(2)
+                            continue
+                        return False
+
+                    # 回调明确 access_denied 时直接结束当前阶段，避免无意义循环。
+                    if ("chatgpt.com/api/auth/callback/openai" in lowered_continue) and ("error=access_denied" in lowered_continue):
+                        self._log(f"{stage_label}回调返回 access_denied，终止当前验证码阶段重试", "warning")
+                        return False
+
                 return True
 
             if chatgpt_stage:
@@ -3909,16 +3934,19 @@ class RegistrationEngine:
             or "https://auth.openai.com/sign-in-with-chatgpt/codex/consent"
         ).strip()
 
+    @staticmethod
+    def _is_registration_gate_url(url: str) -> bool:
+        lowered = str(url or "").strip().lower()
+        if not lowered:
+            return False
+        return ("auth.openai.com/about-you" in lowered) or ("auth.openai.com/add-phone" in lowered)
+
     def _fetch_workspace_selection_context(
         self,
         referer_url: Optional[str] = None,
         *,
         force_probe: bool = False,
     ) -> Tuple[str, str, Dict[str, Any]]:
-        def _is_registration_gate_url(url: str) -> bool:
-            lowered = str(url or "").strip().lower()
-            return bool(lowered) and ("about-you" in lowered or "add-phone" in lowered)
-
         raw_referer = str(
             referer_url
             or self._last_validate_otp_continue_url
@@ -3927,7 +3955,7 @@ class RegistrationEngine:
         ).strip()
         consent_page_url = raw_referer or self._resolve_workspace_selection_referer(referer_url)
         has_explicit_consent_url = _looks_like_codex_consent_url(raw_referer)
-        should_probe_default_consent = _is_registration_gate_url(consent_page_url) or (
+        should_probe_default_consent = self._is_registration_gate_url(consent_page_url) or (
             force_probe and not has_explicit_consent_url
         )
         if (not consent_page_url) or should_probe_default_consent:
@@ -3945,7 +3973,7 @@ class RegistrationEngine:
                         timeout=20,
                     )
                     response_url = str(getattr(response, "url", request_url) or request_url).strip()
-                    if response_url and ("localhost:1455" not in response_url.lower()) and (not _is_registration_gate_url(response_url)):
+                    if response_url and ("localhost:1455" not in response_url.lower()) and (not self._is_registration_gate_url(response_url)):
                         consent_page_url = response_url
                     consent_text = str(getattr(response, "text", "") or "")
                 except Exception as exc:

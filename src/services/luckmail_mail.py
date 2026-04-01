@@ -124,6 +124,10 @@ class LuckMailService(BaseEmailService):
         self._orders_by_email: Dict[str, Dict[str, Any]] = {}
         # 记录每个订单/Token 最近返回过的验证码，避免后续阶段反复拿到旧码。
         self._recent_codes_by_order: Dict[str, Dict[str, float]] = {}
+        # 记录每个订单/Token 最近一次成功使用的 message_id，避免重复消费旧邮件。
+        self._last_used_message_ids: Dict[str, str] = {}
+        # 最近一次成功取码的元信息，供上层做验证码去重。
+        self.last_verification_meta: Dict[str, Any] = {}
         self._data_dir = Path(__file__).resolve().parents[2] / "data"
         self._registered_file = self._data_dir / "luckmail_registered_emails.json"
         self._failed_file = self._data_dir / "luckmail_failed_emails.json"
@@ -197,6 +201,53 @@ class LuckMailService(BaseEmailService):
             stale = [k for k, v in order_cache.items() if v < expire_before]
             for key in stale:
                 order_cache.pop(key, None)
+
+    @staticmethod
+    def _parse_mail_timestamp(value: Any) -> Optional[float]:
+        text = str(value or "").strip()
+        if not text:
+            return None
+        # epoch / epoch_ms
+        try:
+            numeric = float(text)
+            if numeric > 10_000_000_000:  # ms
+                numeric = numeric / 1000.0
+            if numeric > 0:
+                return numeric
+        except Exception:
+            pass
+
+        # ISO datetime
+        normalized = text.replace("Z", "+00:00")
+        try:
+            dt = datetime.fromisoformat(normalized)
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            return dt.timestamp()
+        except Exception:
+            return None
+
+    def _extract_token_mail_meta(self, result: Any) -> Dict[str, Any]:
+        mail_payload = self._extract_field(result, "mail") or {}
+        if not isinstance(mail_payload, dict):
+            mail_payload = {}
+        message_id = str(
+            mail_payload.get("message_id")
+            or mail_payload.get("id")
+            or mail_payload.get("mail_id")
+            or ""
+        ).strip()
+        received_at_raw = (
+            mail_payload.get("received_at")
+            or mail_payload.get("created_at")
+            or mail_payload.get("timestamp")
+            or ""
+        )
+        mail_ts = self._parse_mail_timestamp(received_at_raw)
+        return {
+            "message_id": message_id,
+            "mail_ts": mail_ts,
+        }
 
     def _now_iso(self) -> str:
         return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
@@ -904,6 +955,7 @@ class LuckMailService(BaseEmailService):
         pattern: str = OTP_CODE_PATTERN,
         otp_sent_at: Optional[float] = None,
     ) -> Optional[str]:
+        self.last_verification_meta = {}
         order_info = self._find_order(email=email, email_id=email_id)
 
         token = ""
@@ -970,6 +1022,21 @@ class LuckMailService(BaseEmailService):
                     return None
 
                 now_ts = time.time()
+                mail_meta = self._extract_token_mail_meta(result)
+                message_id = str(mail_meta.get("message_id") or "").strip()
+                mail_ts = mail_meta.get("mail_ts")
+
+                if otp_sent_at and (mail_ts is not None) and (mail_ts + 2 < float(otp_sent_at)):
+                    # 明确早于本轮发码时间窗口，判定旧邮件。
+                    time.sleep(poll_interval)
+                    continue
+
+                if message_id:
+                    last_message_id = str(self._last_used_message_ids.get(code_key) or "").strip()
+                    if last_message_id and message_id == last_message_id:
+                        time.sleep(poll_interval)
+                        continue
+
                 if otp_guard_until and now_ts < otp_guard_until and self._is_recent_code(code_key, code, now_ts):
                     time.sleep(poll_interval)
                     continue
@@ -980,11 +1047,20 @@ class LuckMailService(BaseEmailService):
                     continue
 
                 self._remember_code(code_key, code, now_ts)
+                if message_id:
+                    self._last_used_message_ids[code_key] = message_id
+                self.last_verification_meta = {
+                    "mail_id": message_id or code_key,
+                    "mail_ts": mail_ts if mail_ts is not None else now_ts,
+                    "code": code,
+                    "fingerprint": f"{mail_ts if mail_ts is not None else now_ts}|{message_id or code_key}|{code}",
+                }
                 self.update_status(True)
                 return code
 
             time.sleep(poll_interval)
 
+        self.last_verification_meta = {}
         return None
 
     def list_emails(self, **kwargs) -> List[Dict[str, Any]]:

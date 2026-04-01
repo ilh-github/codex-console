@@ -326,18 +326,6 @@ async def get_service_types():
                 ]
             },
             {
-                "value": "cloudmail",
-                "label": "CloudMail",
-                "description": "CloudMail 自部署 Cloudflare Worker 邮箱服务，使用管理口令创建邮箱并轮询验证码",
-                "config_fields": [
-                    {"name": "base_url", "label": "API 地址", "required": True, "placeholder": "https://cloudmail.example.com"},
-                    {"name": "admin_password", "label": "Admin 密码", "required": True, "secret": True},
-                    {"name": "domain", "label": "邮箱域名", "required": True, "placeholder": "example.com"},
-                    {"name": "enable_prefix", "label": "启用前缀", "required": False, "default": True},
-                    {"name": "timeout", "label": "超时时间", "required": False, "default": 30},
-                ]
-            },
-            {
                 "value": "imap_mail",
                 "label": "IMAP 邮箱",
                 "description": "标准 IMAP 协议邮箱（Gmail/QQ/163等），仅用于接收验证码，强制直连",

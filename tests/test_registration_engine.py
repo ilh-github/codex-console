@@ -1,6 +1,7 @@
 import base64
 import json
 import urllib.parse
+from datetime import date
 
 from src.config.constants import EmailServiceType, OPENAI_API_ENDPOINTS, OPENAI_PAGE_TYPES, generate_random_user_info
 from src.core.http_client import OpenAIHTTPClient
@@ -236,6 +237,14 @@ def test_generate_random_user_info_returns_full_name():
     first, last = info["name"].split(" ", 1)
     assert first
     assert last
+
+
+def test_generate_random_user_info_birthdate_is_adult():
+    info = generate_random_user_info()
+    birthdate = date.fromisoformat(info["birthdate"])
+    today = date.today()
+    age = today.year - birthdate.year - ((today.month, today.day) < (birthdate.month, birthdate.day))
+    assert 21 <= age <= 45
 
 
 def test_get_workspace_id_falls_back_to_auth_session_payload():
@@ -597,6 +606,75 @@ def test_verify_email_otp_with_retry_allows_same_code_from_new_mail_fingerprint(
         ("111111", "1|mail-1|111111"),
         ("111111", "2|mail-2|111111"),
     ]
+
+
+def test_verify_email_otp_with_retry_chatgpt_stage_ignores_registration_gate_continue(monkeypatch):
+    email_service = FakeEmailService([
+        {"code": "123456", "meta": {"mail_id": "mail-a", "mail_ts": 1, "code": "123456", "fingerprint": "1|mail-a|123456"}},
+        {"code": "654321", "meta": {"mail_id": "mail-b", "mail_ts": 2, "code": "654321", "fingerprint": "2|mail-b|654321"}},
+    ])
+    engine = RegistrationEngine(email_service)
+    validate_calls = []
+    resend_counter = {"count": 0}
+
+    def fake_validate(code):
+        validate_calls.append(code)
+        engine._last_otp_validation_code = code
+        engine._last_otp_validation_status_code = 200
+        engine._last_otp_validation_outcome = "success"
+        if len(validate_calls) == 1:
+            engine._last_validate_otp_continue_url = "https://auth.openai.com/about-you"
+        else:
+            engine._last_validate_otp_continue_url = "https://chatgpt.com/api/auth/callback/openai?code=ac_ok&state=s1"
+        return True
+
+    monkeypatch.setattr(engine, "_validate_verification_code", fake_validate)
+    monkeypatch.setattr(
+        engine,
+        "_send_verification_code",
+        lambda referer=None: resend_counter.__setitem__("count", resend_counter["count"] + 1) or True,
+    )
+    monkeypatch.setattr(engine, "_prepare_expected_login_otp", lambda grace_seconds=3: None)
+
+    ok = engine._verify_email_otp_with_retry(
+        stage_label="ChatGPT 网页补会话验证码",
+        max_attempts=2,
+        fetch_timeout=1,
+    )
+
+    assert ok is True
+    assert validate_calls == ["123456", "654321"]
+    assert resend_counter["count"] == 1
+
+
+def test_verify_email_otp_with_retry_chatgpt_stage_stops_on_access_denied_callback(monkeypatch):
+    email_service = FakeEmailService([
+        {"code": "111111", "meta": {"mail_id": "mail-x", "mail_ts": 1, "code": "111111", "fingerprint": "1|mail-x|111111"}},
+        {"code": "222222", "meta": {"mail_id": "mail-y", "mail_ts": 2, "code": "222222", "fingerprint": "2|mail-y|222222"}},
+    ])
+    engine = RegistrationEngine(email_service)
+    validate_calls = []
+
+    def fake_validate(code):
+        validate_calls.append(code)
+        engine._last_otp_validation_code = code
+        engine._last_otp_validation_status_code = 200
+        engine._last_otp_validation_outcome = "success"
+        engine._last_validate_otp_continue_url = (
+            "https://chatgpt.com/api/auth/callback/openai?error=access_denied&error_description=denied"
+        )
+        return True
+
+    monkeypatch.setattr(engine, "_validate_verification_code", fake_validate)
+
+    ok = engine._verify_email_otp_with_retry(
+        stage_label="ChatGPT 网页补会话验证码",
+        max_attempts=2,
+        fetch_timeout=1,
+    )
+
+    assert ok is False
+    assert validate_calls == ["111111"]
 
 
 def test_native_backup_prefers_cached_continue_url_before_oauth_authorize(monkeypatch):
